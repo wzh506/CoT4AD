@@ -17,7 +17,7 @@ ORION uniquely combines a QT-Former to aggregate long-term history context, a La
 </div>
 
 ## News
-`[2025/03/22]` [ArXiv]() paper release. Code/Models/Datasets are coming soon. Please stay tuned!
+`[2025/03/26]` [ArXiv](https://arxiv.org/abs/2503.19755) paper release. Code/Models/Datasets are coming soon. Please stay tuned!
 
 
 ## Currently Supported Features
