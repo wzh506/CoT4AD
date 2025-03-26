@@ -1,7 +1,7 @@
 # ORION: A Holistic End-to-End Autonomous Driving Framework by Vision-Language Instructed Action Generation
 
 
-<a href=""><img src='https://img.shields.io/badge/arXiv-ORION-red' alt='Paper PDF'></a>
+<a href="https://arxiv.org/abs/2503.19755"><img src='https://img.shields.io/badge/arXiv-ORION-red' alt='Paper PDF'></a>
 <a href="https://xiaomi-mlab.github.io/Orion/"><img src='https://img.shields.io/badge/Project_Page-ORION-green' alt='Project Page'></a>
 
 <!-- ## Introduction -->
