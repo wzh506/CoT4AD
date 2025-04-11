@@ -1,16 +1,26 @@
-# ORION: A Holistic End-to-End Autonomous Driving Framework by Vision-Language Instructed Action Generation
+<!-- # ORION: A Holistic End-to-End Autonomous Driving Framework by Vision-Language Instructed Action Generation -->
 
+<div align="center">
+<h3>ORION: A Holistic End-to-End Autonomous Driving Framework <br>by Vision-Language Instructed Action Generation</h3>
+
+Haoyu Fu<sup>1\*</sup>, Diankun Zhang<sup>2\*</sup>, Zongchuang Zhao<sup>1\*</sup>, Jianfeng Cui<sup>2</sup>, Dingkang Liang<sup>1†</sup>, <br> Chong Zhang<sup>2</sup>, Dingyuan Zhang<sup>1</sup>, Hongwei Xie<sup>2†</sup>,  Bing Wang<sup>2</sup>, Xiang Bai<sup>1</sup>
+
+<sup>1</sup>  Huazhong University of Science & Technology, <sup>2</sup>  Xiaomi EV 
+
+(\*) Equal contribution. (†) Project leader.
 
 <a href="https://arxiv.org/abs/2503.19755"><img src='https://img.shields.io/badge/arXiv-ORION-red' alt='Paper PDF'></a>
 <a href="https://xiaomi-mlab.github.io/Orion/"><img src='https://img.shields.io/badge/Project_Page-ORION-green' alt='Project Page'></a>
+</div>
+
 
 <!-- ## Introduction -->
-
+## Abstract
 
 End-to-end (E2E) autonomous driving methods still struggle to make correct decisions in interactive closed-loop evaluation due to limited causal reasoning capability. Current methods attempt to leverage the powerful understanding and reasoning abilities of Vision-Language Models (VLMs) to resolve this dilemma.  However, the problem is still open that few VLMs for E2E methods perform well in the closed-loop evaluation due to the gap between the semantic reasoning space and the purely numerical trajectory output in the action space. To tackle this issue, we propose **ORION**, a h**O**listic E2E autonomous d**R**iving framework by v**I**sion-language instructed acti**ON** generation.
 ORION uniquely combines a QT-Former to aggregate long-term history context, a Large Language Model (LLM) for driving scenario reasoning, and a generative planner for precision trajectory prediction. ORION further aligns the reasoning space and the action space to implement a unified E2E optimization for both visual question-answering (VQA) and planning tasks. Our method achieves an impressive closed-loop performance of 77.74 Driving Score (DS) and 54.62\% Success Rate (SR) on the challenge Bench2Drive datasets, which outperforms state-of-the-art (SOTA) methods by a large margin of 14.28 DS and 19.61\% SR.
 
-
+## Overview
 <div align="center">
 <img src="assets/images/framework.jpg" width="1000">
 </div>
