@@ -324,7 +324,7 @@ test_pipeline = [
          tokenizer=llm_path, 
          use_gen_token=use_gen_token,
          max_length=2048,
-         desc_qa=True),
+         desc_qa=False),
     dict(
         type='MultiScaleFlipAug3D',
         img_scale=(1333, 800),
@@ -340,6 +340,36 @@ test_pipeline = [
                 type='CustomCollect3D',\
                 keys=['gt_bboxes_3d', 'gt_labels_3d', 'img', 'ego_his_trajs','input_ids','gt_attr_labels', 'ego_fut_trajs', 'ego_fut_masks','ego_fut_cmd', 'ego_lcf_feat','vlm_labels','can_bus','fut_valid_flag']+collect_keys,
             )]
+    )
+]
+
+inference_only_pipeline = [
+    dict(type='LoadMultiViewImageFromFilesInCeph', to_float32=True),
+    dict(type='ResizeCropFlipRotImage', data_aug_conf = ida_aug_conf, training=False),
+    dict(type='ResizeMultiview3D', img_scale=(640, 640), keep_ratio=False, multiscale_mode='value'),
+    dict(type="NormalizeMultiviewImage", **img_norm_cfg),
+    dict(type="PadMultiViewImage", size_divisor=32),
+    dict(type='LoadAnnoatationCriticalVQATest', 
+         load_type=["critical_qa"],
+         tokenizer=llm_path, 
+         use_gen_token=use_gen_token,
+         max_length=2048,
+         desc_qa=False),
+
+    dict(
+        type='MultiScaleFlipAug3D',
+        img_scale=(1333, 800),
+        pts_scale_ratio=1,
+        flip=False,
+        transforms=[
+            dict(
+                type='PETRFormatBundle3D',
+                collect_keys=collect_keys,
+                class_names=class_names,
+                with_label=False),
+            dict(type='CustomCollect3D',\
+                keys=['img','input_ids','ego_fut_cmd', 'vlm_labels','can_bus']+collect_keys,
+                )]
     )
 ]
 
