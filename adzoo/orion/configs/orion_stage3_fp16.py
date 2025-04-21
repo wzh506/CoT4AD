@@ -154,6 +154,7 @@ eval_cfg = {
             }
 
 use_memory = True
+fp16_infer=True
 num_gpus = 32
 batch_size = 4
 num_iters_per_epoch = 234769 // (num_gpus * batch_size)
@@ -175,6 +176,8 @@ model = dict(
     type='Orion',
     save_path='./results_planning_only/',  #save path for vlm models.
     use_grid_mask=True,
+    fp16_infer=fp16_infer,
+    fp16_eval=fp16_infer,
     frozen=False,
     use_lora=True,
     tokenizer=llm_path,
@@ -300,15 +303,13 @@ model = dict(
 )
 
 dataset_type = "B2DOrionDataset"
-data_root = "data/bench2drive-mini"
-# info_root = "data/infos"
-# map_root = "data/bench2drive/maps"
-# map_file = "data/infos/b2d_map_infos.pkl"
-map_root = None
-map_file = None
+data_root = "data/bench2drive"
+info_root = "data/infos"
+map_root = "data/bench2drive/maps"
+map_file = "data/infos/b2d_map_infos.pkl"
 
 file_client_args = dict(backend="disk")
-ann_file_test="data/infos/b2d_infos_val_mini_zdk.pkl"
+ann_file_test=info_root + f"/b2d_infos_val.pkl"
 
 test_pipeline = [
     dict(type='LoadMultiViewImageFromFilesInCeph', to_float32=True),
@@ -320,7 +321,7 @@ test_pipeline = [
     dict(type="NormalizeMultiviewImage", **img_norm_cfg),
     dict(type="PadMultiViewImage", size_divisor=32),
     dict(type='LoadAnnoatationCriticalVQATest', 
-         load_type=["critical_qa"], # please don't test all the questions in single test, it requires quite long time
+         load_type=["critical_qa"],
          tokenizer=llm_path, 
          use_gen_token=use_gen_token,
          max_length=2048,),

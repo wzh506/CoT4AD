@@ -80,8 +80,13 @@ You also can perform a CoT inference of ORION with (this might be quite slow)
 ./adzoo/orion/orion_dist_eval.sh adzoo/orion/configs/orion_stage3_cot.py [--PATH_CHECKPOINTS] 1
 ```
 
-We recommend inference for ORION on an NVIDIA A100 or other GPUs with more than **32GB** of memory (inference in fp32, as default).
+We recommend inference for ORION on an NVIDIA A100 or other GPUs with more than **32GB** of memory (inference in **FP32**, as default).
 
+Meanwhile, Orion can also perform **FP16** inference and achieve almost the same performance. We recommend fp16 inference on a GPU with more than **17GB** of memory.
+
+``` 
+./adzoo/orion/orion_dist_eval.sh adzoo/orion/configs/orion_stage3_fp16.py [--PATH_CHECKPOINTS] 1
+```
 
 ## Close-loop evaluation
 
