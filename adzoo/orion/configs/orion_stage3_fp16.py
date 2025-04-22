@@ -368,3 +368,4 @@ data = dict(
 log_config = dict(
     interval=10, hooks=[dict(type="TextLoggerHook"), dict(type="TensorboardLoggerHook")]
 )
+fp16=True
