@@ -24,7 +24,7 @@ from mmcv.core.utils.dist_utils import reduce_mean
 from mmcv.core.utils.misc import multi_apply
 
 from mmcv.models.utils import build_transformer,xavier_init
-from mmcv.models import HEADS
+from mmcv.models import HEADS, build_loss
 from mmcv.models.dense_heads.anchor_free_head import AnchorFreeHead
 from mmcv.models.utils.transformer import inverse_sigmoid
 
@@ -137,7 +137,30 @@ class OrionHead(AnchorFreeHead):
                         ffn_dropout=0.0,
                         operation_order=('cross_attn', 'norm', 'ffn', 'norm'))),
                  with_ego_pose = True, # 默认是打开egopose 和我们以前的ego pose对齐
+                 sync_cls_avg_factor=False,
+                 code_weights=None,
                  bbox_coder=None,
+                 loss_cls=dict(
+                     type='CrossEntropyLoss',
+                     bg_cls_weight=0.1,
+                     use_sigmoid=False,
+                     loss_weight=1.0,
+                     class_weight=1.0),
+                 loss_traffic=dict(
+                     type='CrossEntropyLoss',
+                     bg_cls_weight=0.1,
+                     use_sigmoid=False,
+                     loss_weight=1.0,
+                     class_weight=1.0),
+                 loss_bbox=dict(type='L1Loss', loss_weight=5.0),
+                 loss_iou=dict(type='GIoULoss', loss_weight=2.0),
+                 train_cfg=dict(
+                     assigner=dict(
+                         type='HungarianAssigner3D',
+                         cls_cost=dict(type='ClassificationCost', weight=1.),
+                         reg_cost=dict(type='BBoxL1Cost', weight=5.0),
+                         iou_cost=dict(
+                             type='IoUCost', iou_mode='giou', weight=2.0)),),
                  test_cfg=dict(max_per_img=100),
                  scalar = 5,
                  noise_scale = 0.4,
@@ -154,7 +177,15 @@ class OrionHead(AnchorFreeHead):
                  use_pe=False,
                  motion_det_score=None,
                  valid_fut_ts=6,
+                 loss_traj=dict(type='L1Loss', loss_weight=0.25),
+                 loss_traj_cls=dict(
+                     type='FocalLoss',
+                     use_sigmoid=True,
+                     gamma=2.0,
+                     alpha=0.25,
+                     loss_weight=0.8),
                  pred_traffic_light_state=False,
+                 state_velo_threshold=0.5,
                  **kwargs):
         # NOTE here use `AnchorFreeHead` instead of `TransformerHead`,
         # since it brings inconvenience when the initialization of
@@ -163,7 +194,49 @@ class OrionHead(AnchorFreeHead):
             self.code_size = kwargs['code_size']
         else:
             self.code_size = 10
+        if code_weights is not None:
+            self.code_weights = code_weights
+        else:
+            self.code_weights = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.2, 0.2]
+
+        self.code_weights = self.code_weights[:self.code_size]
+
+        if match_costs is not None:
+            self.match_costs = match_costs
+        else:
+            self.match_costs = self.code_weights
         self.with_ego_pose = with_ego_pose
+        self.bg_cls_weight = 0
+        self.sync_cls_avg_factor = sync_cls_avg_factor
+        class_weight = loss_cls.get('class_weight', None)
+        if class_weight is not None and (self.__class__ is OrionHead):
+            assert isinstance(class_weight, float), 'Expected ' \
+                'class_weight to have type float. Found ' \
+                f'{type(class_weight)}.'
+            # NOTE following the official DETR rep0, bg_cls_weight means
+            # relative classification weight of the no-object class.
+            bg_cls_weight = loss_cls.get('bg_cls_weight', class_weight)
+            assert isinstance(bg_cls_weight, float), 'Expected ' \
+                'bg_cls_weight to have type float. Found ' \
+                f'{type(bg_cls_weight)}.'
+            class_weight = torch.ones(num_classes + 1) * class_weight
+            # set background class as the last indice
+            class_weight[num_classes] = bg_cls_weight
+            loss_cls.update({'class_weight': class_weight})
+            if 'bg_cls_weight' in loss_cls:
+                loss_cls.pop('bg_cls_weight')
+            self.bg_cls_weight = bg_cls_weight
+
+        if train_cfg:
+            assert 'assigner' in train_cfg, 'assigner should be provided '\
+                'when train_cfg is set.'
+            assigner = train_cfg['assigner']
+
+
+            self.assigner = build_assigner(assigner)
+            # DETR sampling=False, so use PseudoSampler
+            sampler_cfg = dict(type='PseudoSampler')
+            self.sampler = build_sampler(sampler_cfg, context=self)
 
         self.output_dims = out_dims
         self.n_control = n_control
@@ -179,6 +252,7 @@ class OrionHead(AnchorFreeHead):
         self.match_with_velo = match_with_velo
         self.with_mask = with_mask
         self.num_reg_fcs = num_reg_fcs
+        self.train_cfg = train_cfg
         self.test_cfg = test_cfg
         self.embed_dims = embed_dims
         self.can_bus_len = can_bus_len
@@ -200,13 +274,30 @@ class OrionHead(AnchorFreeHead):
                                        dict(type='ReLU', inplace=True))
         self.num_pred = 6
         self.normedlinear = normedlinear
-        self.traj_num_cls = 1
+        if loss_traj_cls['use_sigmoid'] == True:
+            self.traj_num_cls = 1
+        else:
+          self.traj_num_cls = 2
 
         super(OrionHead, self).__init__(num_classes, in_channels, init_cfg = init_cfg)
         
-        self.cls_out_channels = num_classes
+        self.loss_traj = build_loss(loss_traj)
+        self.loss_traj_cls = build_loss(loss_traj_cls)
+        self.loss_cls = build_loss(loss_cls)
+        self.loss_bbox = build_loss(loss_bbox)
+        self.loss_iou = build_loss(loss_iou)
+        if self.loss_cls.use_sigmoid:
+            self.cls_out_channels = num_classes
+        else:
+            self.cls_out_channels = num_classes + 1
 
         self.transformer = build_transformer(transformer)
+
+        self.code_weights = nn.Parameter(torch.tensor(
+            self.code_weights), requires_grad=False)
+
+        self.match_costs = nn.Parameter(torch.tensor(
+            self.match_costs), requires_grad=False)
 
         self.bbox_coder = build_bbox_coder(bbox_coder)
 
@@ -236,6 +327,9 @@ class OrionHead(AnchorFreeHead):
             self.memory_decoder_mq = build_transformer(self.memory_decoder_transformer)
         self.canbus_dropout = canbus_dropout
         self.pred_traffic_light_state = pred_traffic_light_state
+        if self.pred_traffic_light_state:
+            self.loss_traffic = build_loss(loss_traffic)
+        self.state_velo_threshold = state_velo_threshold
 
         self._init_layers()
         self.reset_memory()
@@ -269,6 +363,7 @@ class OrionHead(AnchorFreeHead):
             traj_branch = nn.Sequential(*traj_branch)
             motion_num_pred = 1
             self.traj_branches = _get_clones(traj_branch, motion_num_pred)
+            self.traj_bg_cls_weight = 0
             traj_cls_branch = []
             for _ in range(self.num_reg_fcs):
                 traj_cls_branch.append(Linear(self.embed_dims*2, self.embed_dims*2))
@@ -292,7 +387,6 @@ class OrionHead(AnchorFreeHead):
             self.pseudo_reference_points = nn.Embedding(self.num_propagated, 3)
 
         self.query_embedding = nn.Embedding(self.num_extra, self.embed_dims)
-
         if self.output_dims is not None:
             can_bus_layers = [
                     nn.Linear(89, self.embed_dims*4), # canbus + command + egopose (b2d中的can_bus是 18维度)
@@ -323,6 +417,7 @@ class OrionHead(AnchorFreeHead):
             for m in self.tl_branches:
                 nn.init.constant_(m[-1].bias, bias_init)
 
+
     def init_weights(self):
         """Initialize weights of the transformer head."""
         # The initialization for transformer is important
@@ -339,9 +434,10 @@ class OrionHead(AnchorFreeHead):
                 if p.dim() > 1:
                     nn.init.xavier_uniform_(p)
         self.transformer.init_weights()
-        bias_init = bias_init_with_prob(0.01)
-        for m in self.cls_branches:
-            nn.init.constant_(m[-1].bias, bias_init)
+        if self.loss_cls.use_sigmoid:
+            bias_init = bias_init_with_prob(0.01)
+            for m in self.cls_branches:
+                nn.init.constant_(m[-1].bias, bias_init)
         if self.use_col_loss:
             for p in self.motion_decoder.parameters():
                 if p.dim() > 1:
@@ -349,7 +445,6 @@ class OrionHead(AnchorFreeHead):
             nn.init.orthogonal_(self.motion_mode_query.weight)
             if self.use_pe:
                 xavier_init(self.pos_mlp_sa, distribution='uniform', bias=0.)
-
     def reset_memory(self):
         self.memory_embedding = None
         self.memory_reference_point = None
@@ -666,7 +761,7 @@ class OrionHead(AnchorFreeHead):
         else:
             tgt[:, :self.num_extra, :] = self.query_embedding.weight.unsqueeze(0)
             query_pos[:, :self.num_extra, :] = query_pos[:, :self.num_extra, :] * 0
-            
+                  
 
         # transformer here is a little different from PETR
         outs_dec = self.transformer(tgt, memory, query_pos, pos_embed, attn_mask, temp_memory, temp_pos)
@@ -849,6 +944,613 @@ class OrionHead(AnchorFreeHead):
                 outs.update(dict(all_traffic_states = all_traffic_states))
 
         return outs, vlm_memory
+    
+    def prepare_for_loss(self, mask_dict):
+        """
+        prepare dn components to calculate loss
+        Args:
+            mask_dict: a dict that contains dn information
+        """
+        if self.pred_traffic_light_state:
+            output_known_class, output_known_coord, output_known_traffic_state = mask_dict['output_known_lbs_bboxes']
+            known_labels, known_bboxs, known_traffic_state, known_traffic_state_mask = mask_dict['known_lbs_bboxes']
+        else:
+            output_known_class, output_known_coord = mask_dict['output_known_lbs_bboxes']
+            known_labels, known_bboxs = mask_dict['known_lbs_bboxes']
+        map_known_indice = mask_dict['map_known_indice'].long()
+        known_indice = mask_dict['known_indice'].long().cpu()
+        batch_idx = mask_dict['batch_idx'].long()
+        bid = batch_idx[known_indice]
+        if len(output_known_class) > 0:
+            output_known_class = output_known_class.permute(1, 2, 0, 3)[(bid, map_known_indice)].permute(1, 0, 2)
+            output_known_coord = output_known_coord.permute(1, 2, 0, 3)[(bid, map_known_indice)].permute(1, 0, 2)
+            if self.pred_traffic_light_state:
+                output_known_traffic_state = output_known_traffic_state.permute(1, 2, 0, 3)[(bid, map_known_indice)].permute(1, 0, 2)
+        num_tgt = known_indice.numel()
+        if self.pred_traffic_light_state:
+            return known_labels, known_bboxs, known_traffic_state, known_traffic_state_mask, output_known_class, output_known_coord, num_tgt, output_known_traffic_state
+        else:
+            return known_labels, known_bboxs, output_known_class, output_known_coord, num_tgt
+
+
+    def _get_target_single(self,
+                           cls_score,
+                           bbox_pred,
+                           gt_labels,
+                           gt_bboxes,
+                           gt_attr_labels,
+                           traffic_pred=None, 
+                           gt_traffic_state=None, 
+                           gt_traffic_mask=None,
+                           gt_bboxes_ignore=None):
+        """"Compute regression and classification targets for one image.
+        Outputs from a single decoder layer of a single feature level are used.
+        Args:
+            cls_score (Tensor): Box score logits from a single decoder layer
+                for one image. Shape [num_query, cls_out_channels].
+            bbox_pred (Tensor): Sigmoid outputs from a single decoder layer
+                for one image, with normalized coordinate (cx, cy, w, h) and
+                shape [num_query, 4].
+            gt_bboxes (Tensor): Ground truth bboxes for one image with
+                shape (num_gts, 4) in [tl_x, tl_y, br_x, br_y] format.
+            gt_labels (Tensor): Ground truth class indexes for one image
+                with shape (num_gts, ).
+            gt_bboxes_ignore (Tensor, optional): Bounding boxes
+                which can be ignored. Default None.
+        Returns:
+            tuple[Tensor]: a tuple containing the following for one image.
+                - labels (Tensor): Labels of each image.
+                - label_weights (Tensor]): Label weights of each image.
+                - bbox_targets (Tensor): BBox targets of each image.
+                - bbox_weights (Tensor): BBox weights of each image.
+                - pos_inds (Tensor): Sampled positive indexes for each image.
+                - neg_inds (Tensor): Sampled negative indexes for each image.
+        """
+
+        num_bboxes = bbox_pred.size(0)
+        # assigner and sampler
+        if self.use_col_loss:
+            gt_fut_trajs = gt_attr_labels[:, :self.fut_ts*2]
+            gt_fut_masks = gt_attr_labels[:, self.fut_ts*2:self.fut_ts*3]
+            num_gt_bbox, gt_traj_c = gt_fut_trajs.shape
+
+        assign_result = self.assigner.assign(bbox_pred, cls_score, gt_bboxes,
+                                                gt_labels, gt_bboxes_ignore, self.match_costs, self.match_with_velo)
+        sampling_result = self.sampler.sample(assign_result, bbox_pred,
+                                              gt_bboxes)
+        pos_inds = sampling_result.pos_inds
+        neg_inds = sampling_result.neg_inds
+
+        # label targets
+        labels = gt_bboxes.new_full((num_bboxes, ),
+                                    self.num_classes,
+                                    dtype=torch.long)
+        label_weights = gt_bboxes.new_ones(num_bboxes)
+        label_traffic_state = gt_bboxes.new_zeros(num_bboxes,2).to(torch.long)
+        label_traffic_mask =  gt_bboxes.new_zeros(num_bboxes).to(torch.bool)
+        # bbox targets
+        code_size = gt_bboxes.size(1)
+        bbox_targets = torch.zeros_like(bbox_pred)[..., :code_size]
+        bbox_weights = torch.zeros_like(bbox_pred)
+        # print(gt_bboxes.size(), bbox_pred.size())
+        if self.use_col_loss:
+            # trajs targets
+            traj_targets = torch.zeros((num_bboxes, gt_traj_c), dtype=torch.float32, device=bbox_pred.device)
+            traj_weights = torch.zeros_like(traj_targets)
+            traj_targets[pos_inds] = gt_fut_trajs[sampling_result.pos_assigned_gt_inds]
+            traj_weights[pos_inds] = 1.0
+
+            # Filter out invalid fut trajs
+            traj_masks = torch.zeros_like(traj_targets)  # [num_bboxes, fut_ts*2]
+            gt_fut_masks = gt_fut_masks.unsqueeze(-1).repeat(1, 1, 2).view(num_gt_bbox, -1)  # [num_gt_bbox, fut_ts*2]
+            traj_masks[pos_inds] = gt_fut_masks[sampling_result.pos_assigned_gt_inds]
+            traj_weights = traj_weights * traj_masks
+
+            # Extra future timestamp mask for controlling pred horizon
+            fut_ts_mask = torch.zeros((num_bboxes, self.fut_ts, 2),
+                                    dtype=torch.float32, device=bbox_pred.device)
+            fut_ts_mask[:, :self.valid_fut_ts, :] = 1.0
+            fut_ts_mask = fut_ts_mask.view(num_bboxes, -1)
+            traj_weights = traj_weights * fut_ts_mask
+
+        # DETR
+        if sampling_result.num_gts > 0:
+            bbox_targets[pos_inds] = sampling_result.pos_gt_bboxes
+            bbox_weights[pos_inds] = 1.0
+            labels[pos_inds] = gt_labels[sampling_result.pos_assigned_gt_inds]
+            if gt_traffic_state is not None:
+                label_traffic_state[pos_inds] = gt_traffic_state[sampling_result.pos_assigned_gt_inds]
+                label_traffic_mask[pos_inds] = gt_traffic_mask[sampling_result.pos_assigned_gt_inds]
+        if self.use_col_loss:
+            return (labels, label_weights, bbox_targets, label_traffic_state, label_traffic_mask, bbox_weights, traj_targets,
+                    traj_weights, traj_masks.view(-1, self.fut_ts, 2)[..., 0],
+                    pos_inds, neg_inds)
+        else:        
+            return (labels, label_weights, bbox_targets, label_traffic_state, label_traffic_mask, bbox_weights, pos_inds, neg_inds)
+
+
+
+
+
+    def get_targets(self,
+                    cls_scores_list,
+                    bbox_preds_list,
+                    gt_bboxes_list,
+                    gt_labels_list,
+                    gt_attr_labels_list,
+                    traffic_pred_list, 
+                    gt_traffic_state_list, 
+                    gt_traffic_mask_list,
+                    gt_bboxes_ignore_list=None):
+        """"Compute regression and classification targets for a batch image.
+        Outputs from a single decoder layer of a single feature level are used.
+        Args:
+            cls_scores_list (list[Tensor]): Box score logits from a single
+                decoder layer for each image with shape [num_query,
+                cls_out_channels].
+            bbox_preds_list (list[Tensor]): Sigmoid outputs from a single
+                decoder layer for each image, with normalized coordinate
+                (cx, cy, w, h) and shape [num_query, 4].
+            gt_bboxes_list (list[Tensor]): Ground truth bboxes for each image
+                with shape (num_gts, 4) in [tl_x, tl_y, br_x, br_y] format.
+            gt_labels_list (list[Tensor]): Ground truth class indexes for each
+                image with shape (num_gts, ).
+            gt_bboxes_ignore_list (list[Tensor], optional): Bounding
+                boxes which can be ignored for each image. Default None.
+        Returns:
+            tuple: a tuple containing the following targets.
+                - labels_list (list[Tensor]): Labels for all images.
+                - label_weights_list (list[Tensor]): Label weights for all \
+                    images.
+                - bbox_targets_list (list[Tensor]): BBox targets for all \
+                    images.
+                - bbox_weights_list (list[Tensor]): BBox weights for all \
+                    images.
+                - num_total_pos (int): Number of positive samples in all \
+                    images.
+                - num_total_neg (int): Number of negative samples in all \
+                    images.
+        """
+        assert gt_bboxes_ignore_list is None, \
+            'Only supports for gt_bboxes_ignore setting to None.'
+        num_imgs = len(cls_scores_list)
+        gt_bboxes_ignore_list = [
+            gt_bboxes_ignore_list for _ in range(num_imgs)
+        ]
+        if gt_traffic_state_list is None:
+            traffic_pred_list = [None for _ in cls_scores_list]
+            gt_traffic_state_list = [None for _ in cls_scores_list]
+            gt_traffic_mask_list = [None for _ in cls_scores_list]
+        if gt_attr_labels_list is None:
+            gt_attr_labels_list = [None for _ in cls_scores_list]
+        if self.use_col_loss:
+            (labels_list, label_weights_list, bbox_targets_list, traffic_targets_list, traffic_mask_list,
+            bbox_weights_list, traj_targets_list, traj_weights_list,
+            gt_fut_masks_list, pos_inds_list, neg_inds_list) = multi_apply(
+                self._get_target_single, cls_scores_list, bbox_preds_list,
+                gt_labels_list, gt_bboxes_list, gt_attr_labels_list, 
+                traffic_pred_list, gt_traffic_state_list, gt_traffic_mask_list, 
+                gt_bboxes_ignore_list)
+            num_total_pos = sum((inds.numel() for inds in pos_inds_list))
+            num_total_neg = sum((inds.numel() for inds in neg_inds_list))
+            return (labels_list, label_weights_list, bbox_targets_list, traffic_targets_list, traffic_mask_list, bbox_weights_list,
+                    traj_targets_list, traj_weights_list, gt_fut_masks_list, num_total_pos, num_total_neg)
+        else:
+            (labels_list, label_weights_list, bbox_targets_list, traffic_targets_list, traffic_mask_list,
+            bbox_weights_list, pos_inds_list, neg_inds_list) = multi_apply(
+                self._get_target_single, cls_scores_list, bbox_preds_list,
+                gt_labels_list, gt_bboxes_list, gt_attr_labels_list,
+                traffic_pred_list, gt_traffic_state_list, gt_traffic_mask_list, 
+                gt_bboxes_ignore_list)
+            num_total_pos = sum((inds.numel() for inds in pos_inds_list))
+            num_total_neg = sum((inds.numel() for inds in neg_inds_list))
+            return (labels_list, label_weights_list, bbox_targets_list, traffic_targets_list, traffic_mask_list,
+                    bbox_weights_list, num_total_pos, num_total_neg)
+
+    def loss_single(self,
+                    cls_scores,
+                    bbox_preds,
+                    gt_bboxes_list,
+                    gt_labels_list,
+                    traj_preds=None,
+                    traj_cls_preds = None,
+                    gt_attr_labels_list = None,
+                    traffic_preds=None, 
+                    gt_traffic_state_list=None,
+                    gt_traffic_mask_list=None,
+                    gt_bboxes_ignore_list=None):
+        """"Loss function for outputs from a single decoder layer of a single
+        feature level.
+        Args:
+            cls_scores (Tensor): Box score logits from a single decoder layer
+                for all images. Shape [bs, num_query, cls_out_channels].
+            bbox_preds (Tensor): Sigmoid outputs from a single decoder layer
+                for all images, with normalized coordinate (cx, cy, w, h) and
+                shape [bs, num_query, 4].
+            gt_bboxes_list (list[Tensor]): Ground truth bboxes for each image
+                with shape (num_gts, 4) in [tl_x, tl_y, br_x, br_y] format.
+            gt_labels_list (list[Tensor]): Ground truth class indexes for each
+                image with shape (num_gts, ).
+            gt_bboxes_ignore_list (list[Tensor], optional): Bounding
+                boxes which can be ignored for each image. Default None.
+        Returns:
+            dict[str, Tensor]: A dictionary of loss components for outputs from
+                a single decoder layer.
+        """
+        num_imgs = cls_scores.size(0)
+        cls_scores_list = [cls_scores[i] for i in range(num_imgs)]
+        bbox_preds_list = [bbox_preds[i] for i in range(num_imgs)]
+        traffic_pred_list = [traffic_preds[i] if traffic_preds is not None else None for i in range(num_imgs) ]
+
+        cls_reg_targets = self.get_targets(cls_scores_list, bbox_preds_list,
+                                        gt_bboxes_list, gt_labels_list, gt_attr_labels_list,
+                                        traffic_pred_list, gt_traffic_state_list, gt_traffic_mask_list,
+                                        gt_bboxes_ignore_list)
+        if self.use_col_loss:
+            (labels_list, label_weights_list, bbox_targets_list, traffic_targets_list, traffic_mask_list, bbox_weights_list,
+            traj_targets_list, traj_weights_list, gt_fut_masks_list,
+            num_total_pos, num_total_neg) = cls_reg_targets
+        else:  
+            (labels_list, label_weights_list, bbox_targets_list, traffic_targets_list, traffic_mask_list, bbox_weights_list,
+            num_total_pos, num_total_neg) = cls_reg_targets
+
+        labels = torch.cat(labels_list, 0)
+        label_weights = torch.cat(label_weights_list, 0)
+        bbox_targets = torch.cat(bbox_targets_list, 0)
+        bbox_weights = torch.cat(bbox_weights_list, 0)
+        if self.use_col_loss:
+            traj_targets = torch.cat(traj_targets_list, 0)
+            traj_weights = torch.cat(traj_weights_list, 0)
+            gt_fut_masks = torch.cat(gt_fut_masks_list, 0)
+
+        # classification loss
+        cls_scores = cls_scores.reshape(-1, self.cls_out_channels)
+        # construct weighted avg_factor to match with the official DETR repo
+        cls_avg_factor = num_total_pos * 1.0 + \
+            num_total_neg * self.bg_cls_weight
+        if self.sync_cls_avg_factor:
+            cls_avg_factor = reduce_mean(
+                cls_scores.new_tensor([cls_avg_factor]))
+
+        cls_avg_factor = max(cls_avg_factor, 1)
+        loss_cls = self.loss_cls(
+            cls_scores, labels, label_weights, avg_factor=cls_avg_factor)
+
+
+        loss_traffic = torch.tensor(0.,device=loss_cls.device)
+        loss_affect = torch.tensor(0.,device=loss_cls.device)
+        if self.pred_traffic_light_state:
+            traffic_state_label = torch.cat(traffic_targets_list)
+            traffic_state_mask = torch.cat(traffic_mask_list)
+            traffic_state_pred = traffic_preds.reshape(-1, traffic_preds.shape[-1])
+            traffic_light_label = traffic_state_label[:,0]
+            traffic_affect_target = traffic_state_label[:,1]
+            traffic_light_pred = traffic_state_pred[:,:3]
+            traffic_affect_pred = traffic_state_pred[:,3:]
+            traffic_avg_factor = traffic_state_mask.sum()
+            if traffic_state_mask.sum():
+                loss_traffic = self.loss_traffic(traffic_light_pred[traffic_state_mask.to(torch.bool)], 
+                                    traffic_light_label[traffic_state_mask.to(torch.bool)].to(torch.long), avg_factor=traffic_avg_factor) # multi-class
+                loss_affect = self.loss_traffic(traffic_affect_pred[traffic_state_mask.to(torch.bool)], 
+                                    torch.logical_not(traffic_affect_target[traffic_state_mask.to(torch.bool)]).to(torch.long))  # single-class
+                loss_traffic = torch.nan_to_num(loss_traffic)
+                loss_affect = torch.nan_to_num(loss_affect)
+            else:
+                loss_traffic = traffic_light_pred.sum() * 0. # dummy loss 
+                loss_affect = traffic_light_pred.sum() * 0.
+
+        # Compute the average number of gt boxes accross all gpus, for
+        # normalization purposes
+        num_total_pos = loss_cls.new_tensor([num_total_pos])
+        num_total_pos = torch.clamp(reduce_mean(num_total_pos), min=1).item()
+
+        # regression L1 loss
+        bbox_preds = bbox_preds.reshape(-1, bbox_preds.size(-1))
+        normalized_bbox_targets = normalize_bbox(bbox_targets, self.pc_range)
+        isnotnan = torch.isfinite(normalized_bbox_targets).all(dim=-1)
+        bbox_weights = bbox_weights * self.code_weights
+
+        loss_bbox = self.loss_bbox(
+                bbox_preds[isnotnan, :10], normalized_bbox_targets[isnotnan, :10], bbox_weights[isnotnan, :10], avg_factor=num_total_pos)
+
+        loss_cls = torch.nan_to_num(loss_cls)
+        loss_bbox = torch.nan_to_num(loss_bbox)
+        if self.use_col_loss:
+            # traj regression loss
+            best_traj_preds = self.get_best_fut_preds(
+                traj_preds.reshape(-1, self.fut_mode, self.fut_ts, 2),
+                traj_targets.reshape(-1, self.fut_ts, 2), gt_fut_masks)
+
+            neg_inds = (bbox_weights[:, 0] == 0)
+            traj_labels = self.get_traj_cls_target(
+                traj_preds.reshape(-1, self.fut_mode, self.fut_ts, 2),
+                traj_targets.reshape(-1, self.fut_ts, 2),
+                gt_fut_masks, neg_inds)
+
+            loss_traj = self.loss_traj(
+                best_traj_preds[isnotnan],
+                traj_targets[isnotnan],
+                traj_weights[isnotnan],
+                avg_factor=num_total_pos)
+
+            # if self.use_traj_lr_warmup:
+            if False:
+                loss_scale_factor = get_traj_warmup_loss_weight(self.epoch, self.tot_epoch)
+                loss_traj = loss_scale_factor * loss_traj
+
+            # traj classification loss
+            traj_cls_scores = traj_cls_preds.reshape(-1, self.fut_mode)
+            # construct weighted avg_factor to match with the official DETR repo
+            traj_cls_avg_factor = num_total_pos * 1.0 + \
+                num_total_neg * self.traj_bg_cls_weight
+            if self.sync_cls_avg_factor:
+                traj_cls_avg_factor = reduce_mean(
+                    traj_cls_scores.new_tensor([traj_cls_avg_factor]))
+
+            traj_cls_avg_factor = max(traj_cls_avg_factor, 1)
+            loss_traj_cls = self.loss_traj_cls(
+                traj_cls_scores, traj_labels, label_weights, avg_factor=traj_cls_avg_factor
+            )
+
+            if digit_version(TORCH_VERSION) >= digit_version('1.8'):
+                loss_traj = torch.nan_to_num(loss_traj)
+                loss_traj_cls = torch.nan_to_num(loss_traj_cls)
+        else:
+            loss_traj = torch.zeros_like(loss_cls)
+            loss_traj_cls = torch.zeros_like(loss_cls)
+
+        return loss_cls, loss_bbox, loss_traffic, loss_affect, loss_traj, loss_traj_cls
+   
+    def dn_loss_single(self,
+                    cls_scores,
+                    bbox_preds,
+                    traffic_scores,
+                    known_bboxs,
+                    known_labels,
+                    known_traffic_state, 
+                    known_traffic_state_mask,
+                    num_total_pos=None):
+        """"Loss function for outputs from a single decoder layer of a single
+        feature level.
+        Args:
+            cls_scores (Tensor): Box score logits from a single decoder layer
+                for all images. Shape [bs, num_query, cls_out_channels].
+            bbox_preds (Tensor): Sigmoid outputs from a single decoder layer
+                for all images, with normalized coordinate (cx, cy, w, h) and
+                shape [bs, num_query, 4].
+            gt_bboxes_list (list[Tensor]): Ground truth bboxes for each image
+                with shape (num_gts, 4) in [tl_x, tl_y, br_x, br_y] format.
+            gt_labels_list (list[Tensor]): Ground truth class indexes for each
+                image with shape (num_gts, ).
+            gt_bboxes_ignore_list (list[Tensor], optional): Bounding
+                boxes which can be ignored for each image. Default None.
+        Returns:
+            dict[str, Tensor]: A dictionary of loss components for outputs from
+                a single decoder layer.
+        """
+        # classification loss
+        cls_scores = cls_scores.reshape(-1, self.cls_out_channels)
+        # construct weighted avg_factor to match with the official DETR repo
+        cls_avg_factor = num_total_pos * 3.14159 / 6 * self.split * self.split  * self.split ### positive rate
+        if self.sync_cls_avg_factor:
+            cls_avg_factor = reduce_mean(
+                cls_scores.new_tensor([cls_avg_factor]))
+        bbox_weights = torch.ones_like(bbox_preds)
+        label_weights = torch.ones_like(known_labels)
+        cls_avg_factor = max(cls_avg_factor, 1)
+        loss_cls = self.loss_cls(
+            cls_scores, known_labels.long(), label_weights, avg_factor=cls_avg_factor)
+
+        loss_traffic = torch.tensor(0.,device=loss_cls.device)
+        loss_affect = torch.tensor(0.,device=loss_cls.device)
+        if traffic_scores is not None:
+            assert known_traffic_state is not None and known_traffic_state_mask is not None
+            traffic_avg_factor = known_traffic_state_mask.sum()
+            if traffic_avg_factor:
+                loss_traffic = self.loss_traffic(traffic_scores[known_traffic_state_mask.to(torch.bool)][:,:-1], 
+                                    known_traffic_state[known_traffic_state_mask.to(torch.bool)][:,0].to(torch.long), avg_factor=traffic_avg_factor)
+                loss_affect = self.loss_traffic(traffic_scores[known_traffic_state_mask.to(torch.bool)][:,-1:], 
+                                    torch.logical_not(known_traffic_state[known_traffic_state_mask.to(torch.bool)][:,1]).to(torch.long), avg_factor=traffic_avg_factor)
+            else:
+                loss_traffic = traffic_scores.sum() * 0. # dummy loss 
+                loss_affect = traffic_scores.sum() * 0.
+        # Compute the average number of gt boxes accross all gpus, for
+        # normalization purposes
+        num_total_pos = loss_cls.new_tensor([num_total_pos])
+        num_total_pos = torch.clamp(reduce_mean(num_total_pos), min=1).item()
+
+        # regression L1 loss
+        bbox_preds = bbox_preds.reshape(-1, bbox_preds.size(-1))
+        normalized_bbox_targets = normalize_bbox(known_bboxs, self.pc_range)
+        isnotnan = torch.isfinite(normalized_bbox_targets).all(dim=-1)
+
+        bbox_weights = bbox_weights * self.code_weights
+
+        
+        loss_bbox = self.loss_bbox(
+                bbox_preds[isnotnan, :10], normalized_bbox_targets[isnotnan, :10], bbox_weights[isnotnan, :10], avg_factor=num_total_pos)
+
+        loss_cls = torch.nan_to_num(loss_cls)
+        loss_bbox = torch.nan_to_num(loss_bbox)
+        loss_traffic = torch.nan_to_num(loss_traffic)
+        loss_affect = torch.nan_to_num(loss_affect)
+        
+        return self.dn_weight * loss_cls, self.dn_weight * loss_bbox, self.dn_weight * loss_traffic, self.dn_weight * loss_affect
+    
+    @force_fp32(apply_to=('preds_dicts'))
+    def loss(self,
+             gt_bboxes_list,
+             gt_labels_list,
+             preds_dicts,
+             gt_attr_labels,
+             gt_traffic_state=None,
+             gt_traffic_state_mask=None,
+             gt_bboxes_ignore=None):
+        """"Loss function.
+        Args:
+            gt_bboxes_list (list[Tensor]): Ground truth bboxes for each image
+                with shape (num_gts, 4) in [tl_x, tl_y, br_x, br_y] format.
+            gt_labels_list (list[Tensor]): Ground truth class indexes for each
+                image with shape (num_gts, ).
+            preds_dicts:
+                all_cls_scores (Tensor): Classification score of all
+                    decoder layers, has shape
+                    [nb_dec, bs, num_query, cls_out_channels].
+                all_bbox_preds (Tensor): Sigmoid regression
+                    outputs of all decode layers. Each is a 4D-tensor with
+                    normalized coordinate format (cx, cy, w, h) and shape
+                    [nb_dec, bs, num_query, 4].
+                enc_cls_scores (Tensor): Classification scores of
+                    points on encode feature map , has shape
+                    (N, h*w, num_classes). Only be passed when as_two_stage is
+                    True, otherwise is None.
+                enc_bbox_preds (Tensor): Regression results of each points
+                    on the encode feature map, has shape (N, h*w, 4). Only be
+                    passed when as_two_stage is True, otherwise is None.
+            gt_bboxes_ignore (list[Tensor], optional): Bounding boxes
+                which can be ignored for each image. Default None.
+        Returns:
+            dict[str, Tensor]: A dictionary of loss components.
+        """
+        assert gt_bboxes_ignore is None, \
+            f'{self.__class__.__name__} only supports ' \
+            f'for gt_bboxes_ignore setting to None.'
+
+        all_cls_scores = preds_dicts['all_cls_scores']
+        all_bbox_preds = preds_dicts['all_bbox_preds']
+
+        num_dec_layers = len(all_cls_scores)
+        device = gt_labels_list[0].device
+        gt_bboxes_list = [torch.cat(
+            (gt_bboxes.gravity_center, gt_bboxes.tensor[:, 3:]),
+            dim=1).to(device) for gt_bboxes in gt_bboxes_list]
+
+        all_gt_bboxes_list = [gt_bboxes_list for _ in range(num_dec_layers)]
+        all_gt_labels_list = [gt_labels_list for _ in range(num_dec_layers)]
+        all_gt_bboxes_ignore_list = [
+            gt_bboxes_ignore for _ in range(num_dec_layers)
+        ]
+        if self.pred_traffic_light_state:
+            all_traffic_preds = preds_dicts['all_traffic_states']
+            all_gt_traffic_state = [gt_traffic_state for _ in range(num_dec_layers)]
+            all_gt_traffic_mask = [gt_traffic_state_mask for _ in range(num_dec_layers)]
+        else:
+            all_traffic_preds = [None for _ in range(num_dec_layers)]
+            all_gt_traffic_state = [None for _ in range(num_dec_layers)]
+            all_gt_traffic_mask = [None for _ in range(num_dec_layers)]
+        if self.use_col_loss:
+            all_traj_preds = preds_dicts['all_traj_preds'] # ([6, 4, 1120, 6, 12])
+            all_traj_cls_scores = preds_dicts['all_traj_cls_scores']# ([6, 4, 1120, 6])
+            all_gt_attr_labels_list = [gt_attr_labels for _ in range(num_dec_layers)]
+        else:
+            all_traj_preds = [None for _ in range(num_dec_layers)]
+            all_traj_cls_scores = [None for _ in range(num_dec_layers)]
+            all_gt_attr_labels_list = [None for _ in range(num_dec_layers)] 
+
+        losses_cls, losses_bbox, losses_traffic, losses_affect, loss_traj, loss_traj_cls= multi_apply(
+            self.loss_single, all_cls_scores, all_bbox_preds,
+            all_gt_bboxes_list, all_gt_labels_list, all_traj_preds,
+            all_traj_cls_scores,all_gt_attr_labels_list,
+            all_traffic_preds, all_gt_traffic_state, all_gt_traffic_mask,
+            all_gt_bboxes_ignore_list)
+
+
+        
+
+        loss_dict = dict()
+
+        # loss_dict['size_loss'] = size_loss
+        # loss from the last decoder layer
+        loss_dict['loss_cls'] = losses_cls[-1]
+        loss_dict['loss_bbox'] = losses_bbox[-1]
+        if self.use_col_loss:
+            loss_dict['loss_traj'] = loss_traj[-1]
+            loss_dict['loss_traj_cls'] = loss_traj_cls[-1]
+
+            # Planning Loss
+            batch, num_agent = all_traj_preds[-1].shape[:2]
+            agent_fut_preds = all_traj_preds[-1].view(batch, num_agent, self.fut_mode, self.fut_ts, 2)
+            agent_fut_cls_preds = all_traj_cls_scores[-1].view(batch, num_agent, self.fut_mode)
+        if self.pred_traffic_light_state:
+            loss_dict['loss_traffic'] = losses_traffic[-1]
+            loss_dict['loss_affect'] = losses_affect[-1]
+
+
+        # loss from other decoder layers
+        num_dec_layer = 0
+        for loss_cls_i, loss_bbox_i, loss_traffic_i, loss_affect_i in zip(losses_cls[:-1],
+                                           losses_bbox[:-1],
+                                           losses_traffic[:-1],
+                                           losses_affect[:-1],
+                                           ):
+            loss_dict[f'd{num_dec_layer}.loss_cls'] = loss_cls_i
+            loss_dict[f'd{num_dec_layer}.loss_bbox'] = loss_bbox_i
+            if self.pred_traffic_light_state:
+                loss_dict[f'd{num_dec_layer}.loss_traffic'] = loss_traffic_i
+                loss_dict[f'd{num_dec_layer}.loss_affect'] = loss_affect_i
+            num_dec_layer += 1
+        
+        if preds_dicts['dn_mask_dict'] is not None:
+            if self.pred_traffic_light_state:
+                known_labels, known_bboxs, known_traffic_state, known_traffic_state_mask, output_known_class, output_known_coord, num_tgt, output_known_traffic_state = self.prepare_for_loss(preds_dicts['dn_mask_dict'])
+            else:
+                known_labels, known_bboxs, output_known_class, output_known_coord, num_tgt = self.prepare_for_loss(preds_dicts['dn_mask_dict'])
+            all_known_bboxs_list = [known_bboxs for _ in range(num_dec_layers)]
+            all_known_labels_list = [known_labels for _ in range(num_dec_layers)]
+            all_num_tgts_list = [
+                num_tgt for _ in range(num_dec_layers)
+            ]
+            if self.pred_traffic_light_state:
+                all_known_traffic_state_list = [known_traffic_state for _ in range(num_dec_layers)]
+                all_known_traffic_state_mask_list = [known_traffic_state_mask for _ in range(num_dec_layers)]
+            else:
+                all_known_traffic_state_list = [None for _ in range(num_dec_layers)]
+                all_known_traffic_state_mask_list = [None for _ in range(num_dec_layers)]
+                output_known_traffic_state = [None for _ in range(num_dec_layers)]
+            dn_losses_cls, dn_losses_bbox, dn_losses_traffic, dn_losses_affect = multi_apply(
+                self.dn_loss_single, output_known_class, output_known_coord, output_known_traffic_state,
+                all_known_bboxs_list, all_known_labels_list, all_known_traffic_state_list, all_known_traffic_state_mask_list,
+                all_num_tgts_list)
+            loss_dict['dn_loss_cls'] = dn_losses_cls[-1]
+            loss_dict['dn_loss_bbox'] = dn_losses_bbox[-1]
+            if self.pred_traffic_light_state:
+                loss_dict['dn_loss_traffic'] = dn_losses_traffic[-1]
+                loss_dict['dn_loss_affect'] = dn_losses_affect[-1]
+            num_dec_layer = 0
+            for loss_cls_i, loss_bbox_i, loss_traffic_i, loss_affect_i in zip(dn_losses_cls[:-1],
+                                            dn_losses_bbox[:-1],
+                                            dn_losses_traffic[:-1],
+                                            dn_losses_affect[:-1]):
+                loss_dict[f'd{num_dec_layer}.dn_loss_cls'] = loss_cls_i
+                loss_dict[f'd{num_dec_layer}.dn_loss_bbox'] = loss_bbox_i
+                if self.pred_traffic_light_state:
+                    loss_dict[f'd{num_dec_layer}.dn_loss_traffic'] = loss_traffic_i
+                    loss_dict[f'd{num_dec_layer}.dn_loss_affect'] = loss_affect_i
+                num_dec_layer += 1
+                
+        elif self.with_dn:
+            dn_losses_cls, dn_losses_bbox = multi_apply(
+                self.loss_single, all_cls_scores, all_bbox_preds,
+                all_gt_bboxes_list, all_gt_labels_list, 
+                all_gt_bboxes_ignore_list)
+            loss_dict['dn_loss_cls'] = dn_losses_cls[-1].detach()
+            loss_dict['dn_loss_bbox'] = dn_losses_bbox[-1].detach()     
+            num_dec_layer = 0
+            for loss_cls_i, loss_bbox_i in zip(dn_losses_cls[:-1],
+                                            dn_losses_bbox[:-1]):
+                loss_dict[f'd{num_dec_layer}.dn_loss_cls'] = loss_cls_i.detach()     
+                loss_dict[f'd{num_dec_layer}.dn_loss_bbox'] = loss_bbox_i.detach()     
+                num_dec_layer += 1
+        if self.use_col_loss:
+            agent_outs = {
+                    'agent_preds': all_bbox_preds[-1][..., 0:2],
+                    'agent_fut_preds': agent_fut_preds,
+                    'agent_score_preds':all_cls_scores[-1].sigmoid(),
+                    'agent_fut_cls_preds': agent_fut_cls_preds.sigmoid(),
+                }
+            return loss_dict, agent_outs
+        else:
+            return loss_dict
 
     @force_fp32(apply_to=('preds_dicts'))
     def get_motion_bboxes(self, preds_dicts, img_metas, rescale=False):
@@ -1046,3 +1748,65 @@ class OrionHead(AnchorFreeHead):
 
             ret_list.append([bboxes, scores, labels])
         return ret_list
+
+    def get_best_fut_preds(self,
+             traj_preds,
+             traj_targets,
+             gt_fut_masks):
+        """"Choose best preds among all modes.
+        Args:
+            traj_preds (Tensor): MultiModal traj preds with shape (num_box_preds, fut_mode, fut_ts, 2).
+            traj_targets (Tensor): Ground truth traj for each pred box with shape (num_box_preds, fut_ts, 2).
+            gt_fut_masks (Tensor): Ground truth traj mask with shape (num_box_preds, fut_ts).
+            pred_box_centers (Tensor): Pred box centers with shape (num_box_preds, 2).
+            gt_box_centers (Tensor): Ground truth box centers with shape (num_box_preds, 2).
+
+        Returns:
+            best_traj_preds (Tensor): best traj preds (min displacement error with gt)
+                with shape (num_box_preds, fut_ts*2).
+        """
+
+        cum_traj_preds = traj_preds.cumsum(dim=-2)
+        cum_traj_targets = traj_targets.cumsum(dim=-2)
+
+        # Get min pred mode indices.
+        # (num_box_preds, fut_mode, fut_ts)
+        dist = torch.linalg.norm(cum_traj_targets[:, None, :, :] - cum_traj_preds, dim=-1)
+        dist = dist * gt_fut_masks[:, None, :]
+        dist = dist[..., -1]
+        dist[torch.isnan(dist)] = dist[torch.isnan(dist)] * 0
+        min_mode_idxs = torch.argmin(dist, dim=-1).tolist()
+        box_idxs = torch.arange(traj_preds.shape[0]).tolist()
+        best_traj_preds = traj_preds[box_idxs, min_mode_idxs, :, :].reshape(-1, self.fut_ts*2)
+
+        return best_traj_preds
+
+    def get_traj_cls_target(self,
+             traj_preds,
+             traj_targets,
+             gt_fut_masks,
+             neg_inds):
+        """"Get Trajectory mode classification target.
+        Args:
+            traj_preds (Tensor): MultiModal traj preds with shape (num_box_preds, fut_mode, fut_ts, 2).
+            traj_targets (Tensor): Ground truth traj for each pred box with shape (num_box_preds, fut_ts, 2).
+            gt_fut_masks (Tensor): Ground truth traj mask with shape (num_box_preds, fut_ts).
+            neg_inds (Tensor): Negtive indices with shape (num_box_preds,)
+
+        Returns:
+            traj_labels (Tensor): traj cls labels (num_box_preds,).
+        """
+
+        cum_traj_preds = traj_preds.cumsum(dim=-2)
+        cum_traj_targets = traj_targets.cumsum(dim=-2)
+
+        # Get min pred mode indices.
+        # (num_box_preds, fut_mode, fut_ts)
+        dist = torch.linalg.norm(cum_traj_targets[:, None, :, :] - cum_traj_preds, dim=-1)
+        dist = dist * gt_fut_masks[:, None, :]
+        dist = dist[..., -1]
+        dist[torch.isnan(dist)] = dist[torch.isnan(dist)] * 0
+        traj_labels = torch.argmin(dist, dim=-1)
+        traj_labels[neg_inds] = self.fut_mode
+
+        return traj_labels

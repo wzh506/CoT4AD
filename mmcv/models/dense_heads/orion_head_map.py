@@ -23,7 +23,7 @@ from mmcv.core.utils.dist_utils import reduce_mean
 from mmcv.core.utils.misc import multi_apply
 
 from mmcv.models.utils import build_transformer,xavier_init
-from mmcv.models import HEADS
+from mmcv.models import HEADS, build_loss
 from mmcv.models.dense_heads.anchor_free_head import AnchorFreeHead
 from mmcv.models.utils.transformer import inverse_sigmoid
 
@@ -31,11 +31,10 @@ from math import factorial
 
 from mmcv.models.utils import NormedLinear
 
-from mmcv.models.utils.positional_encoding import pos2posemb1d, pos2posemb3d, nerf_positional_encoding
-from mmcv.utils.misc import MLN, topk_gather, transform_reference_points_lane, memory_refresh, SELayer_Linear
+from mmcv.models.utils.positional_encoding import pos2posemb1d, nerf_positional_encoding
+from mmcv.utils.misc import MLN, topk_gather, transform_reference_points_lane, memory_refresh
 import numpy as np
 import os
-
 @HEADS.register_module()
 class OrionHeadM(AnchorFreeHead):
     """Implements the DETR transformer head.
@@ -88,8 +87,24 @@ class OrionHeadM(AnchorFreeHead):
                  num_pts_vector=20, #16
                  dir_interval=1,
                  transformer=None,
+                 sync_cls_avg_factor=False,
                  code_weights=None,
                  match_costs=None,
+                 loss_cls=dict(
+                     type='CrossEntropyLoss',
+                     bg_cls_weight=0.1,
+                     use_sigmoid=False,
+                     loss_weight=1.0,
+                     class_weight=1.0),
+                 loss_bbox=dict(type='L1Loss', loss_weight=5.0),
+                 loss_dir=dict(type='PtsDirCosLoss', loss_weight=0.005),
+                 train_cfg=dict(
+                     assigner=dict(
+                         type='HungarianAssigner3D',
+                         cls_cost=dict(type='ClassificationCost', weight=1.),
+                         reg_cost=dict(type='BBoxL1Cost', weight=5.0),
+                         iou_cost=dict(
+                             type='IoUCost', iou_mode='giou', weight=2.0)),),
                  test_cfg=dict(max_per_img=100),
                  init_cfg=None,
                  normedlinear=False,
@@ -102,7 +117,50 @@ class OrionHeadM(AnchorFreeHead):
             self.code_size = kwargs['code_size']
         else:
             self.code_size = 10
+        if code_weights is not None:
+            self.code_weights = code_weights
+        else:
+            self.code_weights = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.2, 0.2]
+
+        self.code_weights = self.code_weights[:self.code_size]
+
+        if match_costs is not None:
+            self.match_costs = match_costs
+        else:
+            self.match_costs = self.code_weights
             
+        self.bg_cls_weight = 0
+        self.sync_cls_avg_factor = sync_cls_avg_factor
+        class_weight = loss_cls.get('class_weight', None)
+        if class_weight is not None and (self.__class__ is OrionHeadM):
+            assert isinstance(class_weight, float), 'Expected ' \
+                'class_weight to have type float. Found ' \
+                f'{type(class_weight)}.'
+            # NOTE following the official DETR rep0, bg_cls_weight means
+            # relative classification weight of the no-object class.
+            bg_cls_weight = loss_cls.get('bg_cls_weight', class_weight)
+            assert isinstance(bg_cls_weight, float), 'Expected ' \
+                'bg_cls_weight to have type float. Found ' \
+                f'{type(bg_cls_weight)}.'
+            class_weight = torch.ones(num_classes + 1) * class_weight
+            # set background class as the last indice
+            class_weight[num_classes] = bg_cls_weight
+            loss_cls.update({'class_weight': class_weight})
+            if 'bg_cls_weight' in loss_cls:
+                loss_cls.pop('bg_cls_weight')
+            self.bg_cls_weight = bg_cls_weight
+
+        if train_cfg:
+            assert 'assigner' in train_cfg, 'assigner should be provided '\
+                'when train_cfg is set.'
+            assigner = train_cfg['assigner']
+
+
+            self.assigner = build_assigner(assigner)
+            # DETR sampling=False, so use PseudoSampler
+            sampler_cfg = dict(type='PseudoSampler')
+            self.sampler = build_sampler(sampler_cfg, context=self)
+
         self.with_ego_pos = with_ego_pos
         self.with_mask = with_mask
         self.output_dims = out_dims
@@ -118,6 +176,7 @@ class OrionHeadM(AnchorFreeHead):
         self.num_classes = num_classes
         self.in_channels = in_channels
         self.num_reg_fcs = num_reg_fcs
+        self.train_cfg = train_cfg
         self.test_cfg = test_cfg
         self.fp16_enabled = False
         self.embed_dims = embed_dims
@@ -129,9 +188,22 @@ class OrionHeadM(AnchorFreeHead):
         self.normedlinear = normedlinear
         super(OrionHeadM, self).__init__(num_classes, in_channels, init_cfg = init_cfg)
 
-        self.cls_out_channels = num_classes
+        self.loss_cls = build_loss(loss_cls)
+        self.loss_bbox = build_loss(loss_bbox)
+        self.loss_dir = build_loss(loss_dir)
+
+        if self.loss_cls.use_sigmoid:
+            self.cls_out_channels = num_classes
+        else:
+            self.cls_out_channels = num_classes + 1
 
         self.transformer = build_transformer(transformer)
+
+        self.code_weights = nn.Parameter(torch.tensor(
+            self.code_weights), requires_grad=False)
+
+        self.match_costs = nn.Parameter(torch.tensor(
+            self.match_costs), requires_grad=False)
 
         self.pc_range = nn.Parameter(torch.tensor(
             pc_range), requires_grad=False)
@@ -189,13 +261,15 @@ class OrionHeadM(AnchorFreeHead):
         # The initialization for transformer is important
         self.transformer.init_weights()
         xavier_init(self.reference_points_lane, distribution='uniform', bias=0.)
-        bias_init = bias_init_with_prob(0.01)
-        for m in self.cls_branches:
-            nn.init.constant_(m[-1].bias, bias_init)
+        if self.loss_cls.use_sigmoid:
+            bias_init = bias_init_with_prob(0.01)
+            for m in self.cls_branches:
+                nn.init.constant_(m[-1].bias, bias_init)
         for m in self.reg_branches:
             for param in m.parameters():
                 if param.dim() > 1:
                     nn.init.xavier_uniform_(param)
+
 
     def reset_memory(self):
         self.memory_embedding = None
@@ -310,6 +384,7 @@ class OrionHeadM(AnchorFreeHead):
                                           strict, missing_keys,
                                           unexpected_keys, error_msgs)
     
+
     def forward(self, img_metas, pos_embed, **data):
         """Forward function.
         Args:
@@ -407,6 +482,226 @@ class OrionHeadM(AnchorFreeHead):
         if self.output_dims is not None:
             vlm_memory = self.output_projection(vlm_memory)
         return outs, vlm_memory
+
+
+    def loss(self,
+             gt_lanes,
+             gt_lanes_label,
+             preds_dicts,
+             img_metas,
+             gt_bboxes_ignore=None):
+        """"Loss function.
+        Args:
+            gt_bboxes_list (list[Tensor]): Ground truth bboxes for each image
+                with shape (num_gts, 4) in [tl_x, tl_y, br_x, br_y] format.
+            gt_labels_list (list[Tensor]): Ground truth class indexes for each
+                image with shape (num_gts, ).
+            preds_dicts:
+                all_cls_scores (Tensor): Classification score of all
+                    decoder layers, has shape
+                    [nb_dec, bs, num_lane, cls_out_channels].
+                all_bbox_preds (Tensor): Sigmoid regression
+                    outputs of all decode layers. Each is a 4D-tensor with
+                    normalized coordinate format (cx, cy, w, h) and shape
+                    [nb_dec, bs, num_lane, 4].
+                enc_cls_scores (Tensor): Classification scores of
+                    points on encode feature map , has shape
+                    (N, h*w, num_classes). Only be passed when as_two_stage is
+                    True, otherwise is None.
+                enc_bbox_preds (Tensor): Regression results of each points
+                    on the encode feature map, has shape (N, h*w, 4). Only be
+                    passed when as_two_stage is True, otherwise is None.
+            gt_bboxes_ignore (list[Tensor], optional): Bounding boxes
+                which can be ignored for each image. Default None.
+        Returns:
+            dict[str, Tensor]: A dictionary of loss components.
+        """
+        assert gt_bboxes_ignore is None, \
+            f'{self.__class__.__name__} only supports ' \
+            f'for gt_bboxes_ignore setting to None.'
+
+        all_cls_scores = preds_dicts['all_lane_cls_one2one']
+        all_bbox_preds = preds_dicts['all_lane_preds_one2one']
+        all_cls_scores_one2many_list = preds_dicts['all_lane_cls_one2many']
+        all_bbox_preds_one2many_list = preds_dicts['all_lane_preds_one2many']
+        gt_lanes = [lane.reshape(-1, self.n_control*3) for lane in gt_lanes]
+        num_dec_layers = len(all_cls_scores)
+        all_gt_bboxes_list = [gt_lanes for _ in range(num_dec_layers)]
+        gt_labels = gt_lanes_label
+        all_gt_labels_list = [gt_labels for _ in range(num_dec_layers)]
+        all_gt_bboxes_ignore_list = [
+            gt_bboxes_ignore for _ in range(num_dec_layers)
+        ]
+        img_metas_list = [img_metas for _ in range(num_dec_layers)]
+        
+        # for one2many
+        one2many_gt_bboxes_list = []
+        one2many_gt_labels_list = []
+        
+        for gt_bboxes in gt_lanes:
+            one2many_gt_bboxes_list.append(gt_bboxes.repeat(self.k_one2many, 1))
+        for gt_labels in gt_labels:
+            one2many_gt_labels_list.append(gt_labels.repeat(self.k_one2many))
+        all_gt_bboxes_list_one2many = [one2many_gt_bboxes_list for _ in range(num_dec_layers)]
+        all_gt_labels_list_one2many = [one2many_gt_labels_list for _ in range(num_dec_layers)]
+
+        losses_cls, losses_bbox, losses_dir = multi_apply(
+            self.loss_single, all_cls_scores, all_bbox_preds,
+            all_gt_bboxes_list, all_gt_labels_list, img_metas_list,
+            all_gt_bboxes_ignore_list)
+        
+        img_metas_list_one2many = img_metas_list
+        all_gt_bboxes_ignore_list_one2many = all_gt_bboxes_ignore_list
+        losses_cls_one2many, losses_bbox_one2many, losses_dir_one2many = multi_apply(
+            self.loss_single, all_cls_scores_one2many_list, all_bbox_preds_one2many_list,
+            all_gt_bboxes_list_one2many, all_gt_labels_list_one2many, img_metas_list_one2many,
+            all_gt_bboxes_ignore_list_one2many)
+
+        loss_dict = dict()
+        # loss from the last decoder layer
+        loss_dict['loss_cls_lane'] = losses_cls[-1]
+        loss_dict['loss_cls_H'] = losses_cls_one2many[-1] * self.lambda_one2many
+        loss_dict['loss_bbox_lane'] = losses_bbox[-1]
+        loss_dict['loss_bbox_H'] = losses_bbox_one2many[-1] * self.lambda_one2many
+        # loss_dict['loss_dir'] = losses_dir[-1]
+        # loss_dict['loss_dir_H'] = losses_dir_one2many[-1] * self.lambda_one2many
+        # loss from other decoder layers
+        num_dec_layer = 0
+        for loss_cls_i, loss_bbox_i, loss_dir_i in zip(losses_cls[:-1],
+                                                       losses_bbox[:-1],
+                                                       losses_dir[:-1]):
+            loss_dict[f'd{num_dec_layer}.loss_cls_lane'] = loss_cls_i
+            loss_dict[f'd{num_dec_layer}.loss_cls_H'] = losses_cls_one2many[num_dec_layer] * self.lambda_one2many
+            loss_dict[f'd{num_dec_layer}.loss_bbox_lane'] = loss_bbox_i
+            loss_dict[f'd{num_dec_layer}.loss_bbox_H'] = losses_bbox_one2many[num_dec_layer] * self.lambda_one2many
+            # loss_dict[f'd{num_dec_layer}.loss_dir'] = loss_dir_i
+            # loss_dict[f'd{num_dec_layer}.loss_dir_H'] = losses_dir_one2many[num_dec_layer] * self.lambda_one2many
+            num_dec_layer += 1
+        return loss_dict
+
+    def loss_single(self,
+                    cls_scores,
+                    bbox_preds,
+                    gt_bboxes_list,
+                    gt_labels_list,
+                    img_metas,
+                    gt_bboxes_ignore_list=None):
+
+        num_imgs = cls_scores.size(0)
+        cls_scores_list = [cls_scores[i] for i in range(num_imgs)]
+        bbox_preds_list = [bbox_preds[i] for i in range(num_imgs)]
+        cls_reg_targets = self.get_targets(cls_scores_list, bbox_preds_list,
+                                           gt_bboxes_list, gt_labels_list,
+                                           img_metas, gt_bboxes_ignore_list)
+        (labels_list, label_weights_list, bbox_targets_list, bbox_weights_list,
+         num_total_pos, num_total_neg) = cls_reg_targets
+        labels = torch.cat(labels_list, 0)
+        label_weights = torch.cat(label_weights_list, 0)
+        bbox_targets = torch.cat(bbox_targets_list, 0)
+        bbox_weights = torch.cat(bbox_weights_list, 0)
+
+        # classification loss
+        cls_scores = cls_scores.reshape(-1, self.cls_out_channels)
+        # construct weighted avg_factor to match with the official DETR repo
+        cls_avg_factor = num_total_pos * 1.0 + \
+                         num_total_neg * self.bg_cls_weight
+        if self.sync_cls_avg_factor:
+            cls_avg_factor = reduce_mean(
+                cls_scores.new_tensor([cls_avg_factor]))
+        cls_avg_factor = max(cls_avg_factor, 1)
+
+        loss_cls = self.loss_cls(
+            cls_scores, labels, label_weights, avg_factor=cls_avg_factor)
+
+        # Compute the average number of gt boxes across all gpus, for
+        # normalization purposes
+        num_total_pos = loss_cls.new_tensor([num_total_pos])
+        num_total_pos = torch.clamp(reduce_mean(num_total_pos), min=1).item()
+
+
+        dir_weights = bbox_weights.reshape(-1, self.n_control, 3)[:, :-1,0]
+        pts_preds_dir = bbox_preds.reshape(-1, self.n_control, 3)[:,1:,:] - bbox_preds.reshape(-1, self.n_control, 3)[:,:-1,:] # 逐向量相减，得到dir
+        pts_targets_dir = bbox_targets.reshape(-1, self.n_control, 3)[:, 1:,:] - bbox_targets.reshape(-1, self.n_control, 3)[:,:-1,:]
+        loss_dir = self.loss_dir(
+            pts_preds_dir, pts_targets_dir,
+            dir_weights,
+            avg_factor=num_total_pos)
+        bbox_preds = bbox_preds.reshape(-1, self.n_control * 3)
+        
+        # bbox_preds = self.control_points_to_lane_points(bbox_preds)
+        # bbox_targets = self.control_points_to_lane_points(bbox_targets)
+        bbox_weights = bbox_weights.mean(-1).unsqueeze(-1).repeat(1, bbox_preds.shape[-1])
+        # regression L1 loss
+        loss_bbox = self.loss_bbox(
+            bbox_preds, bbox_targets, bbox_weights, avg_factor=num_total_pos)
+        
+
+        
+        return loss_cls, loss_bbox, loss_dir
+
+
+    def get_targets(self,
+                    cls_scores_list,
+                    bbox_preds_list,
+                    gt_bboxes_list,
+                    gt_labels_list,
+                    img_metas,
+                    gt_bboxes_ignore_list=None):
+    
+        assert gt_bboxes_ignore_list is None, \
+            'Only supports for gt_bboxes_ignore setting to None.'
+        num_imgs = len(cls_scores_list)
+        gt_bboxes_ignore_list = [
+            gt_bboxes_ignore_list for _ in range(num_imgs)
+        ]
+        (labels_list, label_weights_list, bbox_targets_list,
+         bbox_weights_list, pos_inds_list, neg_inds_list) = multi_apply(
+            self._get_target_single, cls_scores_list, bbox_preds_list,
+            gt_bboxes_list, gt_labels_list, img_metas, gt_bboxes_ignore_list)
+        num_total_pos = sum((inds.numel() for inds in pos_inds_list))
+        num_total_neg = sum((inds.numel() for inds in neg_inds_list))
+        return (labels_list, label_weights_list, bbox_targets_list,
+                bbox_weights_list, num_total_pos, num_total_neg)
+
+    def _get_target_single(self,
+                           cls_score,
+                           bbox_pred,
+                           gt_bboxes,
+                           gt_labels,
+                           img_meta,
+                           gt_bboxes_ignore=None):
+
+        num_preds = bbox_pred.size(0)
+        # import pdb;pdb.set_trace()
+        # bbox_pred = self.control_points_to_lane_points(bbox_pred)
+        # gt_bboxes = self.control_points_to_lane_points(gt_bboxes)
+        assign_result = self.assigner.assign(bbox_pred, cls_score, gt_bboxes,
+                                             gt_labels, img_meta,
+                                             gt_bboxes_ignore)
+
+        sampling_result = self.sampler.sample(assign_result, bbox_pred,
+                                              gt_bboxes)
+        pos_inds = sampling_result.pos_inds
+        neg_inds = sampling_result.neg_inds
+
+        # label targets
+        labels = gt_bboxes.new_full((num_preds,),
+                                    self.num_classes,
+                                    dtype=torch.long)
+        label_weights = gt_bboxes.new_ones(num_preds)
+
+        # bbox targets
+        bbox_targets = torch.zeros_like(bbox_pred)
+        bbox_weights = torch.zeros_like(bbox_pred)
+        
+        if sampling_result.num_gts > 0:
+            labels[pos_inds] = gt_labels[sampling_result.pos_assigned_gt_inds]
+            bbox_weights[pos_inds] = 1.0
+            bbox_targets[pos_inds] = sampling_result.pos_gt_bboxes
+
+        return (labels, label_weights,
+                bbox_targets, bbox_weights,
+                pos_inds, neg_inds)
 
     def get_bboxes(self, preds_dicts, img_metas, rescale=False):
         """Generate bboxes from bbox head predictions.

@@ -868,6 +868,213 @@ class ResizeCropFlipRotImage():
         return resize, resize_dims, crop, flip, rotate
 
 @PIPELINES.register_module()
+class LoadAnnoatationVQA():
+    def __init__(
+            self, 
+            tokenizer, 
+            max_length, 
+            base_desc_path=None,
+            n_gen=1, 
+            planning_qa_only=False,
+            planning_qa_last=False,
+            use_gen_token=False,
+            pretrain = False,
+            planning_qa_ratio=0.8,
+            mix_qa_training=False,
+            ):
+        
+        self.tokenizer =  AutoTokenizer.from_pretrained(tokenizer,
+                                            model_max_length=max_length,
+                                            padding_side="right",
+                                            use_fast=False,
+                                            )
+        self.n_gen = n_gen
+        self.tokenizer.pad_token = self.tokenizer.unk_token
+        self.planning_qa_only = planning_qa_only
+        self.planning_qa_last = planning_qa_last
+        self.base_desc_path = base_desc_path
+        self.mix_qa_training = mix_qa_training
+        self.planning_qa_ratio = planning_qa_ratio
+        self.r_random_generator = np.random.default_rng(seed=42)
+        self.shuffle_random_generator = np.random.default_rng(seed=99)
+        CLASSES = ('car', 'truck', 'trailer', 'bus', 'construction_vehicle',
+               'bicycle', 'motorcycle', 'pedestrian', 'traffic_cone',
+               'barrier')
+        self.id2cat = {i: name for i, name in enumerate(CLASSES)}
+        self.side = {
+        'singapore': 'left',
+        'boston': 'right',
+        }
+        self.template = [
+                        "What can you tell about the current driving conditions from the images?",
+                        "What can be observed in the panoramic images provided?",
+                        "Can you provide a summary of the current driving scenario based on the input images?",
+                        "What can you observe from the provided images regarding the driving conditions?",
+                        "Please describe the current driving conditions based on the images provided.",
+                        "Can you describe the current weather conditions and the general environment depicted in the images?",
+                        "Please describe the current driving conditions based on the input images.",
+                        "Could you summarize the current driving conditions based on the input images?",
+                        "Please provide an overview of the current driving conditions based on the images.",
+                        "Can you summarize what the panoramic images show?",
+                        "Can you describe the overall conditions and environment based on the images?",
+                        "Could you describe the overall environment and objects captured in the images provided?"
+                        ]
+        self.critical_object_template = [
+                        "Where are the critical objects in the scene and what impact do they have on the ego vehicle?",
+                        "Identify the significant objects in the scene and their specific impacts on the ego vehicle.",
+                        "Can you pinpoint the critical objects in the scene and describe their influence on the ego vehicle?",
+                        "Which objects in the scene are critical, and what effects do they have on the ego vehicle's movement?",
+                        "Please describe the critical objects in the scene, their positions, and the influence they have on the ego vehicle."
+                        ]
+        self.command_template = [
+                                "The current driving instruction is to turn left.",
+                                "The current driving instruction is to turn right.",
+                                "The current driving instruction is to go straight.",
+                                "The current driving instruction is to drive following the lane.",
+                                "The current driving instruction is to change lanes to the left.",
+                                "The current driving instruction is to change lanes to the right."]
+        self.use_gen_token = use_gen_token
+        self.pretrain = pretrain
+
+    def preprocess_vqa(self, results):
+        sources = []
+        if self.base_desc_path is not None:
+            image_path = Path(results['img_filename'][0])
+            json_directory = image_path.parent.parent.parent.stem 
+
+            with open(self.base_desc_path+'/'+json_directory +'/'+ f'{image_path.stem}.json', 'r') as f:
+                desc = json.load(f)
+            sources.extend(desc)
+        return sources  
+    
+    def online_vqa(self, results):
+        sources = []
+        gt_bboxes_2d = []
+        gt_bboxes_3d = copy.deepcopy(results['gt_bboxes_3d'])
+        gt_bboxes_3d_points = gt_bboxes_3d.corners   
+        gt_bboxes_points = gt_bboxes_3d_points.view(-1, 3)
+        gt_bboxes_points = np.concatenate((gt_bboxes_points[:, :3], np.ones(gt_bboxes_points.shape[0])[:, None]), axis=1)
+            
+        if len(gt_bboxes_3d) >= 1:
+            centers = torch.FloatTensor(max(self.n_gen, len(gt_bboxes_3d)), 2).uniform_(0, 20) 
+            bbox_center = gt_bboxes_3d.center[:, :2] + 5 * (torch.rand_like(gt_bboxes_3d.center[:, :2]) * 2 - 1)
+            centers = torch.cat([bbox_center, centers], dim=0)
+            indices = torch.randperm(centers.size(0))[:self.n_gen]
+            centers = centers[indices]
+
+            for center in centers:
+                objs_near = []
+                for i in range(len(gt_bboxes_3d)):
+                    gt_box = gt_bboxes_3d[i]
+                    dis = torch.norm(gt_box.center[0, :2] - center)
+                    if dis < 10:
+                        objs_near.append(self.format_det_answer(i, gt_bboxes_3d, results))
+                if len(objs_near) == 0:
+                    answer = f"There are no objects nearby."
+                else:
+                    answer = "There are the following objects nearby:"
+                    answer += ' '.join(objs_near)
+                sources.append(
+                [
+                    {"from": 'human',
+                    "value": f"What objects are there near the position ({format_number(center[0].item())}, {format_number(center[1].item())})?"},
+                    {"from": 'gpt',
+                    "value": f"{answer}",}
+                    ]
+            )
+            
+        return sources
+    
+    def format_det_answer(self, index, gt_bboxes_3d, results):
+        x = gt_bboxes_3d.tensor[index][0].item()
+        y = gt_bboxes_3d.tensor[index][1].item()
+        z = gt_bboxes_3d.tensor[index][2].item()
+        l = gt_bboxes_3d.tensor[index][3].item()
+        w = gt_bboxes_3d.tensor[index][4].item()
+        h = gt_bboxes_3d.tensor[index][5].item()
+        yaw = gt_bboxes_3d.tensor[index][6].item()
+        vx = gt_bboxes_3d.tensor[index][7].item()
+        vy = gt_bboxes_3d.tensor[index][8].item()
+        yaw = math.degrees(yaw)
+        position = analyze_position(x, y, yaw)
+        answer = f"{self.id2cat[results['gt_labels_3d'][index]]} in the {position} "
+        answer += f"location: <{format_number(x)}, {format_number(y)}>, " 
+        answer += f"length: {l:.1f}, width: {w:.1f}, height: {h:.1f}, "
+        answer += f"angles in degrees: {format_number(yaw)}"
+        if np.sqrt(vx**2 + vy**2) > 0.2:
+            answer += f", velocity: <{format_number(vx)}, {format_number(vy)}>.  "  
+        else:
+            answer += "."
+
+        return answer
+
+    def __call__(self, results):
+        traj = None
+        prompt = f"You are driving a car."
+        sources= []
+            
+        if self.planning_qa_only:
+            sources = []
+        else:
+            sources += self.preprocess_vqa(results) 
+            prompt = f"You are driving a car."
+            online_sources = self.online_vqa(results) # add online vqa
+            sources += online_sources
+        
+        if self.use_gen_token:
+            planning_qa = [
+                [{"from": 'human',
+                "value": "Based on the above information, please provide a safe, executable, and reasonable planning trajectory for the ego car."},
+                {"from": 'gpt',
+                "value": "Here is the planning trajectory <waypoint_ego>"}]
+            ]
+        
+        if not self.pretrain:
+            if self.mix_qa_training:
+                r = self.r_random_generator.uniform()
+                if r < self.planning_qa_ratio:
+                    sources =[]
+                    if self.planning_qa_last:
+                        sources += planning_qa
+                    else:
+                        sources = planning_qa + sources
+                else:
+                    self.shuffle_random_generator.shuffle(sources) 
+            else:# default add
+                if self.planning_qa_last:
+                    sources += planning_qa
+                else:
+                    sources = planning_qa + sources
+  
+        vqa_anno = [item for pair in sources for item in pair]
+        if self.use_gen_token:
+            num_new_tokens = self.tokenizer.add_tokens(["<waypoint_ego>"], special_tokens = True)
+        vqa_anno[0]['value'] = DEFAULT_IMAGE_TOKEN + '\n' + prompt + vqa_anno[0]['value']  
+        vqa_converted = preprocess([vqa_anno], self.tokenizer, True)
+        input_ids = vqa_converted['input_ids'][0]
+        vlm_labels = vqa_converted['labels'][0] 
+        if not self.pretrain:
+            if self.planning_qa_last and (len(vqa_converted['input_ids'][0]) == self.tokenizer.model_max_length): 
+                print('Token indices sequence length is too long, only basic planning QA is reserved.')
+                sources = planning_qa 
+                vqa_anno = [item for pair in sources for item in pair]
+                vqa_anno[0]['value'] = DEFAULT_IMAGE_TOKEN + '\n' + prompt + vqa_anno[0]['value'] 
+                vqa_converted = preprocess([vqa_anno], self.tokenizer, True)
+                input_ids = vqa_converted['input_ids'][0]
+                vlm_labels = vqa_converted['labels'][0]
+
+
+        results['input_ids'] = input_ids
+        results['vlm_labels'] = vlm_labels
+
+        return results
+        
+    def remove_object_numbers(self, text): # for clear data
+        pattern = f'\s\(object \d+\)' 
+        cleaned_text = re.sub(pattern, '', text)
+        return cleaned_text
+
+@PIPELINES.register_module()
 class LoadAnnoatationCriticalVQATest():
     def __init__(
             self, 
@@ -917,7 +1124,6 @@ class LoadAnnoatationCriticalVQATest():
                                 "The current driving instruction is to change lanes to the left.",
                                 "The current driving instruction is to change lanes to the right."]
 
-        self.planning_qa_command = planning_qa_command
         self.desc_qa = desc_qa
         self.use_gen_token = use_gen_token
         self.merge_multiround_qa_into_one = merge_multiround_qa_into_one
@@ -993,9 +1199,6 @@ class LoadAnnoatationCriticalVQATest():
                 {"from": 'gpt',
                 "value": "Here is the planning trajectory <waypoint_ego>"}]
             ]
-        if self.planning_qa_command:
-            drive_command = results['command']
-            sources[-1][0]['value'] = ' ' + self.command_template[drive_command] + ' ' + sources[-1][0]['value']
         vlm_labels = [anno[0]['value'] for anno in sources]
 
         if self.use_gen_token:
@@ -1029,7 +1232,6 @@ def analyze_position(x, y, angle_deg):
         direction += ' left'
     elif y < -2.5:
         direction += ' right'
-
     
     if abs(angle_deg) < 45:
         direction += ", same direction as you, "

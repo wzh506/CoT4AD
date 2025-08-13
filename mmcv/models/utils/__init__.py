@@ -11,6 +11,7 @@ from .weight_init import (INITIALIZERS, Caffe2XavierInit, ConstantInit,
                           trunc_normal_init, uniform_init, xavier_init)
 from .fuse_conv_bn import fuse_conv_bn
 from .normed_predictor import NormedConv2d, NormedLinear
+from .layer_decay_optimizer_constructor import LearningRateDecayOptimizerConstructor
 from .petr_transformers import *
 from .distributions import DistributionModule, PredictModel
 from .layers import Bottleneck

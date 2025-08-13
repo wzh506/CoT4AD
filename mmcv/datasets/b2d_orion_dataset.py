@@ -42,11 +42,9 @@ import math
 
 @DATASETS.register_module()
 class B2DOrionDataset(Custom3DDataset):
-    def __init__(self, overlap_test=False, with_velocity=True, sample_interval=5,
-                 name_mapping=None, eval_cfg=None, map_root=None, map_file=None, past_frames=2, 
-                 future_frames=6, point_cloud_range=[-51.2, -51.2, -5.0, 51.2, 51.2, 3.0],
-                 polyline_points_num=20, *args, eval_mode=['lane', 'det'], **kwargs):
+    def __init__(self, queue_length=4, seq_mode=False, seq_split_num=1, overlap_test=False,with_velocity=True,sample_interval=5,name_mapping= None,eval_cfg = None, map_root =None,map_file=None,past_frames=2, future_frames=6,point_cloud_range = [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0] ,polyline_points_num=20,*args, eval_mode=['lane', 'det'], **kwargs):
         super().__init__(*args, **kwargs)
+        self.queue_length = queue_length
         self.overlap_test = overlap_test
         self.with_velocity = with_velocity
         self.NameMapping  = name_mapping
@@ -54,8 +52,8 @@ class B2DOrionDataset(Custom3DDataset):
         self.sample_interval = sample_interval
         self.past_frames = past_frames
         self.future_frames = future_frames
-        # self.map_root = map_root
-        # self.map_file = map_file
+        self.map_root = map_root
+        self.map_file = map_file
         self.point_cloud_range = np.array(point_cloud_range)
         self.polyline_points_num = polyline_points_num
         self.map_element_class = {'Broken':0, 'Solid':1, 'SolidSolid':2,'Center':3,'TrafficLight':4,'StopSign':5}
@@ -65,14 +63,103 @@ class B2DOrionDataset(Custom3DDataset):
         self.map_ann_file = 'data/infos'
         self.eval_cfg  = eval_cfg
         self.eval_mode = eval_mode
-        # with open(self.map_file,'rb') as f: 
-        #     self.map_infos = pickle.load(f)
+        with open(self.map_file,'rb') as f: 
+            self.map_infos = pickle.load(f)
+        if seq_mode:
+            self.num_frame_losses = 1
+            self.queue_length = 1
+            self.seq_split_num = seq_split_num
+            self.random_length = 0
+            self._set_sequence_group_flag() # Must be called after load_annotations b/c load_annotations does sorting.
+
+    def _set_sequence_group_flag(self):
+        """
+        Set each sequence to be a different group
+        """
+        res = []
+
+        curr_sequence = 0
+        curr_scene_token = self.data_infos[0]['folder']
+
+        for idx in range(len(self.data_infos)):
+            if idx != 0 and self.data_infos[idx]['folder'] != curr_scene_token:
+                # Not first frame and # new folder -> new sequence
+                curr_sequence += 1
+                curr_scene_token = self.data_infos[idx]['folder']
+            res.append(curr_sequence)
+
+        self.flag = np.array(res, dtype=np.int64)
+
+        if self.seq_split_num != 1:
+            if self.seq_split_num == 'all':
+                self.flag = np.array(range(len(self.data_infos)), dtype=np.int64)
+            else:
+                bin_counts = np.bincount(self.flag)
+                new_flags = []
+                curr_new_flag = 0
+                for curr_flag in range(len(bin_counts)):
+                    curr_sequence_length = np.array(
+                        list(range(0, 
+                                bin_counts[curr_flag], 
+                                math.ceil(bin_counts[curr_flag] / self.seq_split_num)))
+                        + [bin_counts[curr_flag]])
+
+                    for sub_seq_idx in (curr_sequence_length[1:] - curr_sequence_length[:-1]):
+                        for _ in range(sub_seq_idx):
+                            new_flags.append(curr_new_flag)
+                        curr_new_flag += 1
+
+                assert len(new_flags) == len(self.flag)
+                assert len(np.bincount(new_flags)) == len(np.bincount(self.flag)) * self.seq_split_num
+                self.flag = np.array(new_flags, dtype=np.int64)
 
     def invert_pose(self, pose):
         inv_pose = np.eye(4)
         inv_pose[:3, :3] = np.transpose(pose[:3, :3])
         inv_pose[:3, -1] = - inv_pose[:3, :3] @ pose[:3, -1]
         return inv_pose
+
+    def prepare_train_data(self, index):
+        """
+        Training data preparation.
+        Args:
+            index (int): Index for accessing the target data.
+        Returns:
+            dict: Training data dict of the corresponding index.
+        """
+        queue = []
+        index_list = list(range(index-self.queue_length*self.sample_interval, index,self.sample_interval))
+        random.shuffle(index_list)
+        index_list = sorted(index_list[1:])
+        index_list.append(index)
+        for i in index_list:
+            i = max(0, i)
+            input_dict = self.get_data_info(i)
+            if input_dict is None:
+                return None
+            self.pre_pipeline(input_dict)
+            example = self.pipeline(input_dict)
+            gt_labels,gt_bboxes = self.get_map_info(index)
+            example['map_gt_labels_3d'] = DC(gt_labels, cpu_only=False)
+            example['map_gt_bboxes_3d'] = DC(gt_bboxes, cpu_only=True)
+            
+            if self.filter_empty_gt and \
+                    (example is None or ~(example['gt_labels_3d']._data != -1).any()):
+                return None
+            queue.append(example)
+        return self.union2one(queue)
+
+
+    def union2one(self, queue):
+        imgs_list = [each['img'].data for each in queue]
+        metas_map = {}
+        for i, each in enumerate(queue):
+            metas_map[i] = each['img_metas'].data
+
+        queue[-1]['img'] = DC(torch.stack(imgs_list), cpu_only=False, stack=True)
+        queue[-1]['img_metas'] = DC(metas_map, cpu_only=True)
+        queue = queue[-1]
+        return queue
 
     def get_data_info(self, index):
         """Get data info according to the given index.
@@ -230,6 +317,7 @@ class B2DOrionDataset(Custom3DDataset):
             points = lane_points[idx]
             points = np.concatenate([points,np.ones((points.shape[0],1))],axis=-1)
             points_in_lidar = (world2lidar @ points.T).T
+            # points_in_lidar = np.dot(points, world2lidar.T)
             mask = (points_in_lidar[:,0]>self.point_cloud_range[0]) & (points_in_lidar[:,0]<self.point_cloud_range[3]) & (points_in_lidar[:,1]>self.point_cloud_range[1]) & (points_in_lidar[:,1]<self.point_cloud_range[4])
             points_in_lidar_range = points_in_lidar[mask,0:2]
             if len(points_in_lidar_range) > 1:
@@ -243,6 +331,7 @@ class B2DOrionDataset(Custom3DDataset):
             points = trigger_volumes_points[idx]
             points = np.concatenate([points,np.ones((points.shape[0],1))],axis=-1)
             points_in_lidar = (world2lidar @ points.T).T
+            # points_in_lidar = np.dot(points, world2lidar.T)
             mask = (points_in_lidar[:,0]>self.point_cloud_range[0]) & (points_in_lidar[:,0]<self.point_cloud_range[3]) & (points_in_lidar[:,1]>self.point_cloud_range[1]) & (points_in_lidar[:,1]<self.point_cloud_range[4])
             points_in_lidar_range = points_in_lidar[mask,0:2]
             if mask.all():
@@ -308,8 +397,14 @@ class B2DOrionDataset(Custom3DDataset):
         Returns:
             dict: Data dictionary of the corresponding index.
         """
-        assert self.test_mode
-        return self.prepare_test_data(idx)
+        if self.test_mode:
+            return self.prepare_test_data(idx)
+        while True:
+            data = self.prepare_train_data(idx)
+            if data is None:
+                idx = self._rand_another(idx)
+                continue
+            return data
 
     def get_ego_trajs(self,idx,sample_rate,past_frames,future_frames):
 
@@ -357,7 +452,6 @@ class B2DOrionDataset(Custom3DDataset):
         return command
     
     def get_box_attr_labels(self,idx,sample_rate,frames):
-
 
         adj_idx_list = range(idx,idx+(frames+1)*sample_rate,sample_rate)
         cur_frame = self.data_infos[idx]
@@ -429,10 +523,7 @@ class B2DOrionDataset(Custom3DDataset):
             sample_data = self.data_infos[i]
             gt_boxes = sample_data['gt_boxes']
             for j in range(gt_boxes.shape[0]):
-                if sample_data['gt_names'][j] in self.NameMapping.keys():
-                    class_name = self.NameMapping[sample_data['gt_names'][j]]
-                else:
-                    class_name = sample_data['gt_names'][j]
+                class_name = self.NameMapping[sample_data['gt_names'][j]]
                 if not class_name in self.eval_cfg['class_range'].keys():
                     continue
                 range_x, range_y = self.eval_cfg['class_range'][class_name]
@@ -761,37 +852,7 @@ class B2DOrionDataset(Custom3DDataset):
         Returns:
             dict[str, float]: Results of each evaluation metric.
         """
-        # 判断results中是否有motion的key来计算指标
-        if 'gt_car' in results[0]['metric_results']:
-            result_metric_names = ['EPA', 'ADE', 'FDE', 'MR']
-            motion_cls_names = ['car', 'pedestrian']
-            motion_metric_names = ['gt', 'cnt_ade', 'cnt_fde', 'hit',
-                                'fp', 'ADE', 'FDE', 'MR']
-            all_metric_dict = {}
-            for met in motion_metric_names:
-                for cls in motion_cls_names:
-                    all_metric_dict[met+'_'+cls] = 0.0
-            result_dict = {}
-            for met in result_metric_names:
-                for cls in motion_cls_names:
-                    result_dict[met+'_'+cls] = 0.0
-            
-            alpha = 0.5
-            for i in range(len(results)):
-                for key in all_metric_dict.keys():
-                    all_metric_dict[key] += results[i]['metric_results'][key]
-            
-            for cls in motion_cls_names:
-                result_dict['EPA_'+cls] = (all_metric_dict['hit_'+cls] - \
-                    alpha * all_metric_dict['fp_'+cls]) / all_metric_dict['gt_'+cls]
-                result_dict['ADE_'+cls] = all_metric_dict['ADE_'+cls] / all_metric_dict['cnt_ade_'+cls]
-                result_dict['FDE_'+cls] = all_metric_dict['FDE_'+cls] / all_metric_dict['cnt_fde_'+cls]
-                result_dict['MR_'+cls] = all_metric_dict['MR_'+cls] / all_metric_dict['cnt_fde_'+cls]
-            
-            print('\n')
-            print('-------------- Motion Prediction --------------')
-            for k, v in result_dict.items():
-                print(f'{k}: {v}')
+
         result_files, tmp_dir = self.format_results(results, jsonfile_prefix)
         # NOTE: print planning metric
         print('\n')

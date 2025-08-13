@@ -1,7 +1,7 @@
 <!-- # ORION: A Holistic End-to-End Autonomous Driving Framework by Vision-Language Instructed Action Generation -->
 
 <div align="center">
-<h3>ORION: A Holistic End-to-End Autonomous Driving Framework <br>by Vision-Language Instructed Action Generation</h3>
+<h3>[🎉ICCV 25] ORION: A Holistic End-to-End Autonomous Driving Framework <br>by Vision-Language Instructed Action Generation</h3>
 
 Haoyu Fu<sup>1\*</sup>, Diankun Zhang<sup>2\*</sup>, Zongchuang Zhao<sup>1\*</sup>, Jianfeng Cui<sup>2</sup>, Dingkang Liang<sup>1†</sup>, <br> Chong Zhang<sup>2</sup>, Dingyuan Zhang<sup>1</sup>, Hongwei Xie<sup>2†</sup>,  Bing Wang<sup>2</sup>, Xiang Bai<sup>1</sup>
 
@@ -26,7 +26,9 @@ ORION uniquely combines a QT-Former to aggregate long-term history context, a La
 </div>
 
 ## News
-**`[2025/06/26]`** ORION is accepted by **ICCV 2025**!
+**`[2025/08/13]`** ORION training code and dataset are now released!
+
+`[2025/06/26]` ORION is accepted by **ICCV 2025**🎉🎉🎉!
 
 `[2025/06/26]` ORION training code and dataset will be released, stay tuned！
 
@@ -36,12 +38,12 @@ ORION uniquely combines a QT-Former to aggregate long-term history context, a La
 
 ## Currently Supported Features
 
-- [x] ORION Inference Framework
-- [x] Open-loop Evaluation
-- [x] Close-loop Evalution
-- [x] ORION Checkpoint
-- [ ] Chat-B2D Dataset 
-- [ ] ORION Training Framework
+- [√] ORION Inference Framework
+- [√] Open-loop Evaluation
+- [√] Close-loop Evalution
+- [√] ORION Checkpoint
+- [√] Chat-B2D Dataset 
+- [√] ORION Training Framework
 
 
 
@@ -58,24 +60,40 @@ pip install -r requirements.txt
 
 ```
 
-
 ## Preperation
 You can refer to [here](https://github.com/Thinklab-SJTU/Bench2DriveZoo/blob/uniad/vad/docs/DATA_PREP.md) to prepare the Bench2drive dataset.
 
 ORION uses the pretrained [2D llm weights](https://huggingface.co/exiawsh/pretrain_qformer/) and [vision encoder + projector weights](https://github.com/NVlabs/OmniDrive/releases/download/v1.0/eva02_petr_proj.pth) provided by [Omnidrive](https://github.com/NVlabs/OmniDrive/tree/main)
 ```
-cd /path/to/OmniDrive
+cd /path/to/ORION
 mkdir ckpts
 ```
 The vision encoder + projector weights are extracted from ckpts/pretrain_qformer/, which is pretrained by using llava data.
 
+To help reproduce the results of ORION, our Chat-B2D dataset are provided at [here](https://huggingface.co/datasets/poleyzdk/Chat-B2D/tree/main).
+## Train
+
+ORION follows a three-stage training process. In stage1, you can download the Chat-B2D dataset, then put it under the /data directory.
+``` 
+unzip Chat-B2D.zip -d data/
+```
+
+We use Chat-B2D data for pre-training:
+``` 
+./adzoo/orion/orion_dist_train.sh adzoo/orion/configs/orion_stage1_train.py $GPUS
+```
+
+After the stage1 training is completed, you can start the stage2/3 training using the following commands (Remember to change the load_from in the cfg):
+```
+./adzoo/orion/orion_dist_train.sh adzoo/orion/configs/orion_stage2(3)_train.py $GPUS
+```
 
 ## Open-loop evaluation
 
 You can perform an open-loop evaluation of ORION with the following command
 
 ``` 
-./adzoo/orion/orion_dist_eval.sh adzoo/orion/configs/orion_stage3.py [--PATH_CHECKPOINTS] 1
+./adzoo/orion/orion_dist_eval.sh adzoo/orion/configs/orion_stage3_infer.py [--PATH_CHECKPOINTS] 1
 ```
 
 You also can perform a CoT inference of ORION with (this might be quite slow)
