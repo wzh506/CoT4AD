@@ -118,7 +118,7 @@ class Orion(MVXTwoStageDetector):
                  mix_qa_training=False,
                  loss_plan_reg=dict(type='L1Loss', loss_weight=0.25),
                  loss_plan_bound=dict(type='PlanMapBoundLoss', loss_weight=0.1),
-                 loss_plan_col=dict(type='PlanAgentDisLoss', loss_weight=0.1),
+                 loss_plan_col=dict(type='PlanCollisionLoss', loss_weight=1.0),
                  loss_vae_gen=dict(type='ProbabilisticLoss', loss_weight=1.0),
                  ):
         super(Orion, self).__init__(pts_voxel_layer, pts_voxel_encoder,
@@ -753,12 +753,12 @@ class Orion(MVXTwoStageDetector):
                     bbox_result['labels_3d'] = bbox_result['labels_3d'][mask]
                     bbox_result['trajs_3d'] = bbox_result['trajs_3d'][mask]
 
-                    matched_bbox_result = self.assign_pred_to_gt_vip3d(
-                        bbox_result, gt_bbox, gt_label)
+                    # matched_bbox_result = self.assign_pred_to_gt_vip3d(
+                    #     bbox_result, gt_bbox, gt_label)
 
-                    metric_dict = self.compute_motion_metric_vip3d(
-                            gt_bbox, gt_label, gt_attr_label, bbox_result,
-                            matched_bbox_result, mapped_class_names)
+                    # metric_dict = self.compute_motion_metric_vip3d(
+                    #         gt_bbox, gt_label, gt_attr_label, bbox_result,
+                    #         matched_bbox_result, mapped_class_names)
             
         if self.with_lm_head:
             history_input_output_id = []

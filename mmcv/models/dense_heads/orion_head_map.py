@@ -90,12 +90,12 @@ class OrionHeadM(AnchorFreeHead):
                  sync_cls_avg_factor=False,
                  code_weights=None,
                  match_costs=None,
-                 loss_cls=dict(
-                     type='CrossEntropyLoss',
-                     bg_cls_weight=0.1,
-                     use_sigmoid=False,
-                     loss_weight=1.0,
-                     class_weight=1.0),
+                loss_cls=dict(
+                    type='FocalLoss',
+                    use_sigmoid=True,
+                    gamma=2.0,
+                    alpha=0.25,
+                    loss_weight=2.0),
                  loss_bbox=dict(type='L1Loss', loss_weight=5.0),
                  loss_dir=dict(type='PtsDirCosLoss', loss_weight=0.005),
                  train_cfg=dict(
