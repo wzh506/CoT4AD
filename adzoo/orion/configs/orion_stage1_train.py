@@ -366,7 +366,6 @@ train_pipeline = [
         tokenizer=llm_path, 
         max_length=2048, 
         use_gen_token=use_gen_token,
-        use_history_qa = True,
         pretrain = pretrain,
         ),
 

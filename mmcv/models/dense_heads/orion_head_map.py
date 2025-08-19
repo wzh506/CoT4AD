@@ -90,7 +90,7 @@ class OrionHeadM(AnchorFreeHead):
                  sync_cls_avg_factor=False,
                  code_weights=None,
                  match_costs=None,
-                loss_cls=dict(
+                 loss_cls=dict(
                     type='FocalLoss',
                     use_sigmoid=True,
                     gamma=2.0,

@@ -140,13 +140,13 @@ class OrionHead(AnchorFreeHead):
                  sync_cls_avg_factor=False,
                  code_weights=None,
                  bbox_coder=None,
-                loss_cls=dict(
+                 loss_cls=dict(
                     type='FocalLoss',
                     use_sigmoid=True,
                     gamma=2.0,
                     alpha=0.25,
                     loss_weight=2.0),
-                loss_traffic=dict(
+                 loss_traffic=dict(
                     type='FocalLoss',
                     use_sigmoid=True,
                     gamma=2.0,
