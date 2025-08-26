@@ -53,7 +53,7 @@ from mmcv.utils import force_fp32, auto_fp16
 from ..utils.freeze_module import freeze_module
 from mmcv.models.utils import  DistributionModule, PredictModel,  \
                                 CustomTransformerDecoder, CustomTransformerDecoderLayer, SinusoidalPosEmb, gen_sineembed_for_position, \
-                                    linear_relu_ln
+                                    linear_relu_ln, py_sigmoid_focal_loss
 from mmcv.models.bricks import Linear
 from mmcv.models.builder import HEADS 
 import pickle
@@ -120,6 +120,7 @@ class Orion(MVXTwoStageDetector):
                  loss_plan_bound=dict(type='PlanMapBoundLoss', loss_weight=0.1),
                  loss_plan_col=dict(type='PlanCollisionLoss', loss_weight=1.0),
                  loss_vae_gen=dict(type='ProbabilisticLoss', loss_weight=1.0),
+                 plan_cls_loss_smooth = False,
                  ):
         super(Orion, self).__init__(pts_voxel_layer, pts_voxel_encoder,
                              pts_middle_encoder, pts_fusion_layer,
@@ -254,6 +255,7 @@ class Orion(MVXTwoStageDetector):
                 self.loss_vae_gen = build_loss(loss_vae_gen)
             
             elif self.use_diff_decoder:
+                self.plan_cls_loss_smooth = plan_cls_loss_smooth
                 self.diff_loss_weight = diff_loss_weight
                 self.diff_traj_cls_loss_weight = 10.0
                 self.diff_traj_reg_loss_weight = 8.0
@@ -1253,6 +1255,88 @@ class Orion(MVXTwoStageDetector):
             
 
         return loss_plan_dict
+    
+
+    def loss_planning_diffusion(self,
+                      ego_fut_preds,
+                      ego_fut_cls,
+                      ego_fut_gt,
+                      plan_anchor,
+                      ego_fut_masks,
+                      lane_preds = None,
+                      lane_score_preds = None,
+                    #   agent_preds,
+                    #   agent_fut_preds,
+                    #   agent_score_preds,
+                    #   agent_fut_cls_preds
+                      ):
+        bs, num_mode, ts, d = ego_fut_preds.shape
+        target_traj = ego_fut_gt
+        dist = torch.linalg.norm(target_traj.unsqueeze(1)[...,:2] - plan_anchor, dim=-1)
+        dist = dist.mean(dim=-1)
+        mode_idx = torch.argmin(dist, dim=-1)
+        mode_masks = torch.zeros(*ego_fut_cls.shape[:2],device=ego_fut_cls.device)
+        for mask, idx in zip(mode_masks, mode_idx):
+            mask[idx] = 1
+        mode_masks = mode_masks.to(torch.bool)
+        cls_target = mode_idx
+        mode_idx = mode_idx[...,None,None,None].repeat(1,1,ts,d)
+        best_reg = torch.gather(ego_fut_preds, 1, mode_idx).squeeze(1)
+        # import ipdb; ipdb.set_trace()
+        # Calculate cls loss using focal loss
+        target_classes_onehot = torch.zeros([bs, num_mode],
+                                            dtype=ego_fut_cls.dtype,
+                                            layout=ego_fut_cls.layout,
+                                            device=ego_fut_cls.device)
+        target_classes_onehot.scatter_(1, cls_target.unsqueeze(1), 1)
+
+        loss_plan_l1_weight = ego_fut_masks[:, :, None]
+        
+        loss_plan_l1_weight = loss_plan_l1_weight.repeat(1,  1, 2)
+
+        loss_plan_l1 = self.diff_traj_reg_loss_weight * self.loss_plan_reg(
+            best_reg,
+            target_traj,
+            loss_plan_l1_weight
+        )
+
+        if lane_preds is not None and lane_score_preds is not None:
+            loss_plan_bound = self.loss_plan_bound(
+                best_reg,
+                lane_preds,
+                lane_score_preds,
+                weight=ego_fut_masks,
+                denormalize=False,
+            )
+
+        
+        if self.plan_cls_loss_smooth:
+            loss_plan_cls_weight = torch.clip(dist, min=0, max=10.)*10 # scale factor
+            loss_plan_cls_weight[mode_masks] = 10.
+            loss_plan_cls_weight *= ego_fut_masks.all(dim=-1).to(torch.float).unsqueeze(-1)
+            avg_factor = bs*self.ego_fut_mode
+            loss_cls = self.diff_traj_cls_loss_weight * py_sigmoid_focal_loss(
+                ego_fut_cls,
+                target_classes_onehot,
+                weight=loss_plan_cls_weight,
+                gamma=2.0,
+                alpha=0.25,
+                reduction='mean',
+                avg_factor=avg_factor
+            )
+        else:
+            loss_plan_cls_weight = ego_fut_masks.all(dim=-1).to(torch.float)
+            loss_cls = self.diff_traj_cls_loss_weight * py_sigmoid_focal_loss(
+                ego_fut_cls,
+                target_classes_onehot,
+                weight=loss_plan_cls_weight,
+                gamma=2.0,
+                alpha=0.25,
+                reduction='mean',
+                avg_factor=None
+            )
+
+        return loss_cls, loss_plan_l1, loss_plan_bound
     
     def get_future_labels(self, gt_labels_3d, gt_attr_labels, ego_fut_trajs, device):
 
