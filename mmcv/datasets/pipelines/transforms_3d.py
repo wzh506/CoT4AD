@@ -897,9 +897,7 @@ class LoadAnnoatationVQA():
         self.planning_qa_ratio = planning_qa_ratio
         self.r_random_generator = np.random.default_rng(seed=42)
         self.shuffle_random_generator = np.random.default_rng(seed=99)
-        CLASSES = ('car', 'truck', 'trailer', 'bus', 'construction_vehicle',
-               'bicycle', 'motorcycle', 'pedestrian', 'traffic_cone',
-               'barrier')
+        CLASSES = ('car','van','truck','bicycle','traffic_sign','traffic_cone','traffic_light','pedestrian','others')
         self.id2cat = {i: name for i, name in enumerate(CLASSES)}
         self.side = {
         'singapore': 'left',
