@@ -16,8 +16,13 @@ from torch.nn.functional import linear
 
 from einops import rearrange
 from mmcv.utils import auto_fp16
-# for H20 flash-attn-2.7.0.post2 is ok
+# for H20 flash-attn-2.7.0.post2 is ok 
 from flash_attn.flash_attn_interface import flash_attn_varlen_kvpacked_func
+# try:
+#     from flash_attn.flash_attn_interface import flash_attn_varlen_kvpacked_func as flash_attn_varlen_kvpacked
+# except ImportError:
+#     from flash_attn.flash_attn_interface import flash_attn_varlen_kvpacked
+    
 # for A800/A100
 # from flash_attn.flash_attn_interface import flash_attn_unpadded_kvpacked_func
 from flash_attn.bert_padding import unpad_input, pad_input, index_first_axis

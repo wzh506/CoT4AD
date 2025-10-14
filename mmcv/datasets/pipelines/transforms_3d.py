@@ -886,7 +886,8 @@ class LoadAnnoatationVQA():
         self.tokenizer =  AutoTokenizer.from_pretrained(tokenizer,
                                             model_max_length=max_length,
                                             padding_side="right",
-                                            use_fast=False,
+                                            # use_fast=False,
+                                            use_fast=True,
                                             )
         self.n_gen = n_gen
         self.tokenizer.pad_token = self.tokenizer.unk_token
@@ -1087,7 +1088,8 @@ class LoadAnnoatationCriticalVQATest():
         self.tokenizer =  AutoTokenizer.from_pretrained(tokenizer,
                                             model_max_length=max_length,
                                             padding_side="right",
-                                            use_fast=False,
+                                            # use_fast=False,
+                                            use_fast=True,
                                             )
         self.tokenizer.pad_token = self.tokenizer.unk_token
         self.load_type = load_type

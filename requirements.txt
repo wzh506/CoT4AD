@@ -33,7 +33,7 @@ trimesh
 pytest
 pytest-cov
 pytest-runner
-yapf==0.40.1
+# yapf==0.40.1
 flake8
 trimesh==2.35.39
 similaritymeasures
@@ -46,13 +46,13 @@ tabulate
 ephem
 dictor
 # orion related
-torch==2.4.1+cu118
-torchvision==0.19.1+cu118
+# torch==2.4.1+cu118
+# torchvision==0.19.1+cu118
 flash-attn==0.2.8
 shapely==1.8.5.post1
-transformers == 4.31.0
+# transformers == 4.31.0
 peft==0.12.0
 numpy==1.23.0
 numba==0.48.0
-diffusers==0.32.2
+# diffusers==0.32.2
 SentencePiece

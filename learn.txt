@@ -1,0 +1,31 @@
+
+
+1.环境复用Nio的环境
+requirement中写的0.3.8的flash-attn根本用不了
+
+2.ORION训练流程
+
+VQA训练：
+./adzoo/orion/orion_dist_train.sh adzoo/orion/configs/orion_stage1_train.py 1
+2阶段
+./adzoo/orion/orion_dist_train.sh adzoo/orion/configs/orion_stage2_train.py 1
+3阶段
+./adzoo/orion/orion_dist_train.sh adzoo/orion/configs/orion_stage3_train.py 1
+
+
+开环测试
+./adzoo/orion/orion_dist_eval.sh adzoo/orion/configs/orion_stage3_infer.py ckpts/pretrain_qformer/Orion.pth 1
+./adzoo/orion/orion_dist_eval.sh adzoo/orion/configs/orion_stage3_cot.py ckpts/pretrain_qformer/Orion.pth 1
+稍低一点的精度
+./adzoo/orion/orion_dist_eval.sh adzoo/orion/configs/orion_stage3_fp16.py ckpts/pretrain_qformer/Orion.pth 1
+
+
+闭环测试(需要使用carla模拟器)，注意python版本
+echo "$CARLA_ROOT/PythonAPI/carla/dist/carla-0.9.15-py3.7-linux-x86_64.egg" >> /home/lucian.wang/.conda/envs/nio/lib/python3.8/site-packages/carla.pth
+
+TEAM_CONFIG=adzoo/orion/configs/orion_stage3_agent.py+[CHECKPOINT_PATH]
+
+
+3.报错提示
+1.出现WARNING: tokenization mismatch: 832 vs. 823. (ignored)
+解决方法：

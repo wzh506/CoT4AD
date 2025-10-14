@@ -162,7 +162,8 @@ class Orion(MVXTwoStageDetector):
             self.tokenizer =  AutoTokenizer.from_pretrained(tokenizer,
                                         model_max_length=2048,
                                         padding_side="right",
-                                        use_fast=False,
+                                        # use_fast=False,
+                                        use_fast=True,
                                         )
             self.tokenizer.pad_token = self.tokenizer.unk_token
         else:
@@ -679,7 +680,7 @@ class Orion(MVXTwoStageDetector):
                         wp_loss = wp_loss.mean()
                     wp_loss = torch.nan_to_num(wp_loss)
                     losses.update(wp_loss=wp_loss)
-            else:
+            else: #stage 1走了这个分支
                 waypoint = None
                 vision_embeded = torch.cat([vision_embeded_obj, vision_embeded_map], dim=1) # (1, 513, 4096)
                 vlm_loss= self.lm_head(input_ids=input_ids, attention_mask=vlm_attn_mask, labels=vlm_labels, images=vision_embeded, use_cache=False)
