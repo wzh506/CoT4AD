@@ -480,7 +480,7 @@ class OrionHeadM(AnchorFreeHead):
             'outs_dec_one2many':outs_dec_one2many,
         }
         if self.output_dims is not None:
-            vlm_memory = self.output_projection(vlm_memory)
+            vlm_memory = self.output_projection(vlm_memory) #这个就是最后作为多模态对齐的网络层
         return outs, vlm_memory
 
 

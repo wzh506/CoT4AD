@@ -48,7 +48,7 @@ class LlavaMetaForCausalLM(ABC):
 
     def prepare_inputs_labels_for_multimodal(
         self, input_ids, position_ids, attention_mask, past_key_values, labels, image_features, image_sizes
-    ):
+    ):       
         
         if  image_features is None or input_ids.shape[1] == 1:
             # if past_key_values is not None and image_features is not None and input_ids.shape[1] == 1:
@@ -61,15 +61,17 @@ class LlavaMetaForCausalLM(ABC):
             #     position_ids = torch.sum(attention_mask, dim=1).unsqueeze(-1) - 1
             return input_ids, position_ids, attention_mask, past_key_values, None, labels, None
 
-        
+        image_flag = 0
         if isinstance(image_features,list):
             temp_image_features = []
             for b_id in range(len(image_features[0])):
                 for img_id in range(len(image_features)):
                     temp_image_features.append(image_features[img_id][b_id])
             image_features = temp_image_features
+            image_flag = 0
         else:
             image_features = image_features.reshape(image_features.shape[0], -1, self.hidden_size).to(dtype=self.dtype) # (B, 513, 4096)
+            image_flag = 1
 
         # TODO: image start / end is not implemented here to support pretraining.
         # if getattr(self.config, 'tune_mm_mlp_adapter', False) and getattr(self.config, 'mm_use_im_start_end', False):
@@ -86,12 +88,12 @@ class LlavaMetaForCausalLM(ABC):
             attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
         else:
             attention_mask = attention_mask.bool() # (B, 76)
-        if position_ids is None:
+        if position_ids is None: #强行加上位置编码，而且好像还是没有正余弦信息的那种
             position_ids = torch.arange(0, input_ids.shape[1], dtype=torch.long, device=input_ids.device) # (76,)
         if labels is None:
             labels = torch.full_like(input_ids, IGNORE_INDEX)
 
-        # remove the padding using attention_mask -- TODO: double check
+        # remove the padding using attention_mask -- TODO: double check 为false的地方直接干掉，恢复原来的长度了
         input_ids = [cur_input_ids[cur_attention_mask.cpu()] for cur_input_ids, cur_attention_mask in zip(input_ids, attention_mask)]
         labels = [cur_labels[cur_attention_mask] for cur_labels, cur_attention_mask in zip(labels, attention_mask)]
 
@@ -101,20 +103,20 @@ class LlavaMetaForCausalLM(ABC):
         cur_image_idx = 0
         for batch_idx, cur_input_ids in enumerate(input_ids): # 遍历batch samples
             num_images = (cur_input_ids == IMAGE_TOKEN_INDEX).sum() # 只有一个-200，位置在index 35，估计对应的是句子中image的占位
-            if num_images == 0:
-                cur_image_features = image_features[cur_image_idx]
+            if num_images == 0: #一般情况下，是不可能的，使用的图像特征这里有点问题
+                cur_image_features = image_features[cur_image_idx] if image_flag == 0 else image_features[batch_idx]
                 cur_input_embeds_1 = self.get_model().embed_tokens(cur_input_ids)
                 cur_input_embeds = torch.cat([cur_input_embeds_1, cur_image_features[0:0]], dim=0)
                 new_input_embeds.append(cur_input_embeds)
                 new_labels.append(labels[batch_idx])
                 cur_image_idx += 1
                 continue
-
-            image_token_indices = [-1] + torch.where(cur_input_ids == IMAGE_TOKEN_INDEX)[0].tolist() + [cur_input_ids.shape[0]] # [-1, 35, 76]
+            #好像没有给出是token的prompt，而是直接用Image1来代替（我觉得不合理）
+            image_token_indices = [-1] + torch.where(cur_input_ids == IMAGE_TOKEN_INDEX)[0].tolist() + [cur_input_ids.shape[0]] # [-1, 35, 76]，记录位置和总长度
             cur_input_ids_noim = []
             cur_labels = labels[batch_idx]
             cur_labels_noim = []
-            for i in range(len(image_token_indices) - 1): # 以image token位置为分界，分割出来句子块
+            for i in range(len(image_token_indices) - 1): # 以image token位置为分界，分割出来句子块，你看总共就len(image_token_indices) - 1个句子
                 cur_input_ids_noim.append(cur_input_ids[image_token_indices[i]+1:image_token_indices[i+1]]) # [(35,), (40,)]，分块input ids
                 cur_labels_noim.append(cur_labels[image_token_indices[i]+1:image_token_indices[i+1]]) # [(35,), (40,)]，分块labels
             split_sizes = [x.shape[0] for x in cur_labels_noim] # [35, 40]
@@ -124,18 +126,18 @@ class LlavaMetaForCausalLM(ABC):
             cur_new_input_embeds = []
             cur_new_labels = []
             cur_new_input_ids = []
-
+            # 这个batch的images问答数量
             for i in range(num_images + 1): # 遍历单词分块，在合适位置，embedding给append入image feature，label给append入IGNORE_INDEX，input id给append入IMAGE_TOKEN_INDEX，得到完整句子组成
                 cur_new_input_embeds.append(cur_input_embeds_no_im[i])
                 cur_new_labels.append(cur_labels_noim[i])
                 cur_new_input_ids.append(cur_input_ids_noim[i])
                 if i < num_images:
-                    cur_image_features = image_features[cur_image_idx]
-                    cur_image_idx += 1
+                    cur_image_features = image_features[cur_image_idx] if image_flag == 0 else image_features[batch_idx]
+                    cur_image_idx += 1 #这个表明当前处理的位于哪个batch
                     cur_new_input_embeds.append(cur_image_features)
-                    cur_new_labels.append(torch.full((cur_image_features.shape[0],), IGNORE_INDEX, device=cur_labels.device, dtype=cur_labels.dtype))
+                    cur_new_labels.append(torch.full((cur_image_features.shape[0],), IGNORE_INDEX, device=cur_labels.device, dtype=cur_labels.dtype)) #全部用-100代替
                     cur_new_input_ids.append(torch.full((cur_image_features.shape[0],), IMAGE_TOKEN_INDEX, device=cur_labels.device, dtype=cur_labels.dtype))
-            cur_new_input_embeds = torch.cat(cur_new_input_embeds)
+            cur_new_input_embeds = torch.cat(cur_new_input_embeds) #图像embed的位置不需要计算，直接给忽略的token
             cur_new_labels = torch.cat(cur_new_labels)
             cur_new_input_ids = torch.cat(cur_new_input_ids)
             # 组成batch

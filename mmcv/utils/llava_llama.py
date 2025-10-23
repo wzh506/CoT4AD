@@ -23,15 +23,16 @@ from torch.nn import CrossEntropyLoss
 from transformers import AutoConfig, AutoModelForCausalLM, \
                          LlamaConfig, LlamaModel, LlamaForCausalLM
 
+
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from .llava_arch import LlavaMetaModel, LlavaMetaForCausalLM
 
-
+ #如何init的？
 class LlavaConfig(LlamaConfig):
     model_type = "llava_llama"
 
-
+# LlavaMetaModel根本没有实现任何方法，只是封装了一下config实现方法而已，实际上还是调用LlamaModel初始化
 class LlavaLlamaModel(LlavaMetaModel, LlamaModel):
     config_class = LlavaConfig
 
@@ -41,10 +42,10 @@ class LlavaLlamaModel(LlavaMetaModel, LlamaModel):
 
 class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
     config_class = LlavaConfig
-
+    # from_pretrained调用的时候会实例化这个类
     def __init__(self, config, use_gen_token=False, use_critical_qa=False):
         super(LlamaForCausalLM, self).__init__(config)
-        self.model = LlavaLlamaModel(config)
+        self.model = LlavaLlamaModel(config) #传入一个
         self.hidden_size = config.hidden_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.pretraining_tp = config.pretraining_tp
@@ -112,7 +113,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 attention_mask,
                 past_key_values,
                 labels,
-                images,
+                images, #ORION输入的不是images，而是image_features或者说是env tokens
                 image_sizes
             )
         else:
@@ -124,12 +125,12 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
-        outputs = self.model(
+        outputs = self.model( #使用self.model.config可以看到模型从哪里来的,这个是llava_llama2，无法进入forward查看
             input_ids=input_ids, # None
             attention_mask=attention_mask, # (1, 588)
             position_ids=position_ids, # None
             past_key_values=past_key_values, # None
-            inputs_embeds=inputs_embeds, # (1, 588, 4096)
+            inputs_embeds=inputs_embeds, # (1, 588, 4096)，用images替换原来的占位-200 token
             use_cache=use_cache, # False
             output_attentions=output_attentions, # False
             output_hidden_states=output_hidden_states, # False

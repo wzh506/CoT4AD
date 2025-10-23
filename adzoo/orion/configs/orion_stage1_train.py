@@ -184,7 +184,7 @@ model = dict(
     loss_plan_bound=dict(type='PlanMapBoundLoss', loss_weight=3.0, dis_thresh=1.0),
     loss_vae_gen=dict(type='ProbabilisticLoss', loss_weight=3.0),
     img_backbone=dict(
-        type='EVAViT',
+        type='EVAViT', #backbone，居然不是resnet
         img_size=640, 
         patch_size=16,
         window_size=16,

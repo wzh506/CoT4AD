@@ -10,6 +10,8 @@ from inspect import getfullargspec
 from itertools import repeat
 import torch
 from .llava_llama import LlavaLlamaForCausalLM 
+from .llava_llama3 import LlavaLlama3ForCausalLM #暂时先不用，有点bug
+from transformers import AutoConfig
 from peft import LoraConfig, get_peft_model
 import torch.nn as nn
 import copy
@@ -387,9 +389,9 @@ def locations(features, stride, pad_h, pad_w):
         Arguments:
             features:  (N, C, H, W)
         Return:
-            locations:  (H, W, 2)
+            locations:  (H, W, 2) 生成特征图每个位置的归一化坐标
         """
-
+        #pad_h, pad_w = img_metas[0]['pad_shape'][0][:2] * stride
         h, w = features.size()[-2:]
         device = features.device
         
@@ -409,14 +411,56 @@ def locations(features, stride, pad_h, pad_w):
         locations = locations.reshape(h, w, 2)
         
         return locations
-    
+# 修改load模型的type
 def load_model(base_model, use_lora, frozen, lm_kwargs=dict(), fp16_infer=False):
+    # detect config to decide which Llava class to instantiate
+    try:
+        cfg = AutoConfig.from_pretrained(base_model)
+        model_type = getattr(cfg, 'model_type', None)
+    except Exception:
+        model_type = None
+
+    ModelClass = LlavaLlamaForCausalLM
+    if model_type == 'llava3_llama':
+        ModelClass = LlavaLlama3ForCausalLM
+
     if fp16_infer:
-        model = LlavaLlamaForCausalLM.from_pretrained(base_model, torch_dtype=torch.float16, device_map='cpu', **lm_kwargs)
+        model = ModelClass.from_pretrained(base_model, torch_dtype=torch.float16, device_map='cpu', **lm_kwargs)
         # use_lora = False
         frozen = True
     else:
-        model = LlavaLlamaForCausalLM.from_pretrained(base_model, torch_dtype=torch.float32, device_map='cpu', **lm_kwargs)
+        model = ModelClass.from_pretrained(base_model, torch_dtype=torch.float32, device_map='cpu', **lm_kwargs)
+    
+    model.gradient_checkpointing_enable()
+
+    if frozen:
+        model.eval()
+        for p in model.parameters():
+            p.requires_grad = False
+            
+    if use_lora:
+        peft_config = LoraConfig(
+                r=16,
+                lora_alpha=16,
+                target_modules=("q_proj", "k_proj", "v_proj", "o_proj"),
+                lora_dropout=0.05,
+                bias="none",
+                task_type="CAUSAL_LM")
+        model = get_peft_model(model, peft_config)
+
+        if not fp16_infer:
+            for param in filter(lambda p: p.requires_grad,model.parameters()):
+                param.data = param.data.to(torch.float32)  
+    return model
+
+
+def load_model3(base_model, use_lora, frozen, lm_kwargs=dict(), fp16_infer=False):
+    if fp16_infer:
+        model = LlavaLlama3ForCausalLM.from_pretrained(base_model, torch_dtype=torch.float16, device_map='cpu', **lm_kwargs)
+        # use_lora = False
+        frozen = True
+    else:
+        model = LlavaLlama3ForCausalLM.from_pretrained(base_model, torch_dtype=torch.float32, device_map='cpu', **lm_kwargs)
     
     model.gradient_checkpointing_enable()
 

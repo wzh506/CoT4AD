@@ -966,7 +966,7 @@ class LoadAnnoatationVQA():
                 for i in range(len(gt_bboxes_3d)):
                     gt_box = gt_bboxes_3d[i]
                     dis = torch.norm(gt_box.center[0, :2] - center)
-                    if dis < 10:
+                    if dis < 10: #离得近，赶快记录
                         objs_near.append(self.format_det_answer(i, gt_bboxes_3d, results))
                 if len(objs_near) == 0:
                     answer = f"There are no objects nearby."
@@ -1007,11 +1007,11 @@ class LoadAnnoatationVQA():
 
         return answer
 
-    def __call__(self, results):
+    def __call__(self, results): #这个函数要好好看看，是构建VQA的关键
         traj = None
         prompt = f"You are driving a car."
         sources= []
-            
+        
         if self.planning_qa_only:
             sources = []
         else:
@@ -1020,7 +1020,7 @@ class LoadAnnoatationVQA():
             online_sources = self.online_vqa(results) # add online vqa
             sources += online_sources
         
-        if self.use_gen_token:
+        if self.use_gen_token: #这个用于final stage 的 planning
             planning_qa = [
                 [{"from": 'human',
                 "value": "Based on the above information, please provide a safe, executable, and reasonable planning trajectory for the ego car."},
@@ -1028,12 +1028,12 @@ class LoadAnnoatationVQA():
                 "value": "Here is the planning trajectory <waypoint_ego>"}]
             ]
         
-        if not self.pretrain:
+        if not self.pretrain:# 最后端到端训练才进入这里
             if self.mix_qa_training:
                 r = self.r_random_generator.uniform()
                 if r < self.planning_qa_ratio:
                     sources =[]
-                    if self.planning_qa_last:
+                    if self.planning_qa_last: #token放置的位置有区别
                         sources += planning_qa
                     else:
                         sources = planning_qa + sources
@@ -1043,7 +1043,7 @@ class LoadAnnoatationVQA():
                 if self.planning_qa_last:
                     sources += planning_qa
                 else:
-                    sources = planning_qa + sources
+                    sources = planning_qa + sources #有什么区别，666
   
         vqa_anno = [item for pair in sources for item in pair]
         if self.use_gen_token:
@@ -1052,7 +1052,7 @@ class LoadAnnoatationVQA():
         vqa_converted = preprocess([vqa_anno], self.tokenizer, True)
         input_ids = vqa_converted['input_ids'][0]
         vlm_labels = vqa_converted['labels'][0] 
-        if not self.pretrain:
+        if not self.pretrain: #这是模型infer了
             if self.planning_qa_last and (len(vqa_converted['input_ids'][0]) == self.tokenizer.model_max_length): 
                 print('Token indices sequence length is too long, only basic planning QA is reserved.')
                 sources = planning_qa 

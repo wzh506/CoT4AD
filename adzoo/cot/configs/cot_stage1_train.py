@@ -170,13 +170,13 @@ input_modality = dict(
     use_external=True)
 
 model = dict(
-    type='Orion',
+    type='CoT',
     save_path='./results_planning_only/',  #save path for vlm models.
     use_grid_mask=True,
     frozen=False,
     use_lora=True,
     tokenizer=llm_path,
-    lm_head=llm_path, # set to None if don't use llm head
+    lm_head=None,
     use_gen_token = use_gen_token,
     use_diff_decoder = False, 
     use_col_loss = use_col_loss,
@@ -202,7 +202,7 @@ model = dict(
         with_cp=True, 
         frozen=False,), 
     map_head=dict(
-        type='OrionHeadM',
+        type='CoTHeadM',
         num_classes=6,
         in_channels=1024,
         out_dims=4096,
@@ -244,7 +244,7 @@ model = dict(
         loss_bbox=dict(type='L1Loss', loss_weight=0.02),
         loss_dir=dict(type='PtsDirCosLoss', loss_weight=0.0)), #
     pts_bbox_head=dict(
-        type='OrionHead',
+        type='CoTHead',
         num_classes=9,
         in_channels=1024,
         out_dims=4096,

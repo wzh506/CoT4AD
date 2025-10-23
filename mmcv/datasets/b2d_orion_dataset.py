@@ -138,7 +138,7 @@ class B2DOrionDataset(Custom3DDataset):
             if input_dict is None:
                 return None
             self.pre_pipeline(input_dict)
-            example = self.pipeline(input_dict)
+            example = self.pipeline(input_dict) #这个才是重中之中，涉及到读取VQA数据集的任务
             gt_labels,gt_bboxes = self.get_map_info(index)
             example['map_gt_labels_3d'] = DC(gt_labels, cpu_only=False)
             example['map_gt_bboxes_3d'] = DC(gt_bboxes, cpu_only=True)
@@ -180,11 +180,11 @@ class B2DOrionDataset(Custom3DDataset):
                     from lidar to different cameras.
                 - ann_info (dict): Annotation info.
         """
-        info = self.data_infos[index]
+        info = self.data_infos[index] #有两个，一个叫map_infos,另一个叫train_infos.这个是train_infos，index加1就是下一帧！
 
         for i in range(len(info['gt_names'])):
             if info['gt_names'][i] in self.NameMapping.keys():
-                info['gt_names'][i] = self.NameMapping[info['gt_names'][i]]
+                info['gt_names'][i] = self.NameMapping[info['gt_names'][i]] #类别映射，比如将bus映射为truck
         
         ego2global = np.linalg.inv(info['sensors']['LIDAR_TOP']['world2lidar'])  # in fact, lidar2global
         ego_pose = ego2global
@@ -246,35 +246,35 @@ class B2DOrionDataset(Custom3DDataset):
                 ))
             
         #if not self.test_mode:
-        annos = self.get_ann_info(index)
-        input_dict['ann_info'] = annos
+        annos = self.get_ann_info(index) #这里面获得一些重要的标注数据
+        input_dict['ann_info'] = annos #这个是object的标注信息
         yaw = input_dict['ego_yaw']
         rotation = list(Quaternion(axis=[0, 0, 1], radians=yaw))
         
         if yaw < 0:
             yaw += 2*np.pi
-        yaw_in_degree = yaw / np.pi * 180 
+        yaw_in_degree = yaw / np.pi * 180  #从弧度转换为角度，因此它的 yaw 是定义在世界坐标系下的（当前位置和相对坐标系比较）
         
         can_bus = np.zeros(18)
-        can_bus[:3] = input_dict['ego_translation']
+        can_bus[:3] = input_dict['ego_translation'] #
         can_bus[3:7] = rotation
         can_bus[7:10] = input_dict['ego_vel']
         can_bus[10:13] = input_dict['ego_accel']
         can_bus[13:16] = input_dict['ego_rotation_rate']
         can_bus[16] = yaw
         can_bus[17] = yaw_in_degree
-        input_dict['can_bus'] = can_bus
+        input_dict['can_bus'] = can_bus #车辆控制信息都在这里，这些居然就是can_bus，那bev感知中使用这些有啥用
         ego_lcf_feat = np.zeros(9)
         ego_lcf_feat[0:2] = input_dict['ego_translation'][0:2]
         ego_lcf_feat[2:4] = input_dict['ego_accel'][2:4]
         ego_lcf_feat[4] = input_dict['ego_rotation_rate'][-1]
         ego_lcf_feat[5] = info['ego_size'][1]
         ego_lcf_feat[6] = info['ego_size'][0]
-        ego_lcf_feat[7] = np.sqrt(input_dict['ego_translation'][0]**2+input_dict['ego_translation'][1]**2)
+        ego_lcf_feat[7] = np.sqrt(input_dict['ego_translation'][0]**2+input_dict['ego_translation'][1]**2) #和原点的距离
         ego_lcf_feat[8] = info['steer']
-        ego_his_trajs, ego_fut_trajs, ego_fut_masks, command, command_nohot = self.get_ego_trajs(index,self.sample_interval,self.past_frames,self.future_frames)
+        ego_his_trajs, ego_fut_trajs, ego_fut_masks, command, command_nohot = self.get_ego_trajs(index,self.sample_interval,self.past_frames,self.future_frames) #这里还是要做模仿学习
         input_dict['ego_his_trajs'] = ego_his_trajs
-        input_dict['ego_fut_trajs'] = ego_fut_trajs
+        input_dict['ego_fut_trajs'] = ego_fut_trajs#这是前一刻的渐进误差
         input_dict['ego_fut_masks'] = ego_fut_masks
         input_dict['ego_fut_cmd'] = command
         input_dict['command'] = command_nohot
@@ -382,7 +382,7 @@ class B2DOrionDataset(Custom3DDataset):
             gt_bboxes_3d,
             box_dim=gt_bboxes_3d.shape[-1],
             origin=(0.5, 0.5, 0.5)).convert_to(self.box_mode_3d)
-        attr_labels = self.get_box_attr_labels(index,self.sample_interval,self.future_frames)
+        attr_labels = self.get_box_attr_labels(index,self.sample_interval,self.future_frames) # 这是一个诡异的函数
         anns_results = dict(
             gt_bboxes_3d=gt_bboxes_3d,
             gt_labels_3d=gt_labels_3d,
@@ -418,25 +418,25 @@ class B2DOrionDataset(Custom3DDataset):
             if adj_idx <0 or adj_idx>=len(self.data_infos):
                 break
             adj_frame = self.data_infos[adj_idx]
-            if adj_frame['folder'] != cur_frame ['folder']:
+            if adj_frame['folder'] != cur_frame ['folder']: #和我一样的操作，时序融合就是这样干我只能说
                 break
             world2lidar_ego_adj = adj_frame['sensors']['LIDAR_TOP']['world2lidar']
-            adj2cur_lidar = world2lidar_lidar_cur @ np.linalg.inv(world2lidar_ego_adj)
-            xy = adj2cur_lidar[0:2,3]
+            adj2cur_lidar = world2lidar_lidar_cur @ np.linalg.inv(world2lidar_ego_adj)# 将其他位置投影到当前lidar坐标系下
+            xy = adj2cur_lidar[0:2,3]#其他帧在当前的lidar坐标系下的位置
             full_adj_track[j,0:2] = xy
             full_adj_adj_mask[j] = 1
         offset_track = full_adj_track[1:] - full_adj_track[:-1]
-        for j in range(past_frames-1,-1,-1):
+        for j in range(past_frames-1,-1,-1):#开始，终止，步长
             if full_adj_adj_mask[j] == 0:
                 offset_track[j] = offset_track[j+1]
         for j in range(past_frames,past_frames+future_frames,1):
 
             if full_adj_adj_mask[j+1] == 0 :
-                offset_track[j] = 0
+                offset_track[j] = 0 #这个为啥，没有看懂，正常出来就是全1
         command = self.command2hot(cur_frame['command_near'])
         command_nohot = self.command2nohot(cur_frame['command_near'])
         return offset_track[:past_frames].copy(), offset_track[past_frames:].copy(), full_adj_adj_mask[-future_frames:].copy(), command,command_nohot
-    
+        # 放置顺序： 0，future,past 666
     def command2hot(self,command,max_dim=6):
         if command < 0:
             command = 4

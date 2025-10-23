@@ -8,15 +8,15 @@ voxel_size = [0.2, 0.2, 8]
 img_norm_cfg = dict(
    mean=[123.675, 116.28, 103.53], std=[58.395, 57.12, 57.375], to_rgb=True)
 
+# map has classes: divider, ped_crossing, boundary
 map_classes = ['Broken','Solid','SolidSolid','Center','TrafficLight','StopSign']
-queue_length = 1  # each sequence contains `queue_length` frames.
-map_fixed_ptsnum_per_gt_line = 11
+
+map_fixed_ptsnum_per_gt_line = 11 # now only support fixed_pts > 0
 map_eval_use_same_gt_sample_num_flag = True
 map_num_classes = len(map_classes)
 past_frames = 2
 future_frames = 6
 _dim_ = 256
-_pos_dim_ = _dim_//2
 _ffn_dim_ = _dim_*2
 ida_aug_conf = {
         "resize_lim": (0.37, 0.45),
@@ -146,26 +146,31 @@ eval_cfg = {
             "class_range":{'car':(50,50),'van':(50,50),'truck':(50,50),'bicycle':(40,40),'traffic_sign':(30,30),'traffic_cone':(30,30),'traffic_light':(30,30),'pedestrian':(40,40)}
             }
 
+queue_length = 1  # each sequence contains `queue_length` frames.
 ### traj prediction args ###
+predict_steps = 12
+predict_modes = 6
+use_nonlinear_optimizer = True
 use_memory = True
 num_gpus = 32
 batch_size = 4
 num_iters_per_epoch = 234769 // (num_gpus * batch_size)
 num_epochs = 6
 llm_path = 'ckpts/pretrain_qformer/'
-use_gen_token = True
-use_col_loss = True
+use_gen_token = False
 collect_keys = ['lidar2img', 'cam_intrinsic', 'timestamp', 'ego_pose', 'ego_pose_inv', 'command']
-# pretrain = True
+pretrain = True # stage1 pretrain, False for stage 2 finetune
 
+use_col_loss = False
 input_modality = dict(
     use_lidar=False,
     use_camera=True,
     use_radar=False,
     use_map=False,
     use_external=True)
+
 model = dict(
-    type='Orion',
+    type='CoT',
     save_path='./results_planning_only/',  #save path for vlm models.
     use_grid_mask=True,
     frozen=False,
@@ -177,7 +182,6 @@ model = dict(
     use_col_loss = use_col_loss,
     loss_plan_reg=dict(type='L1Loss', loss_weight=3.0),
     loss_plan_bound=dict(type='PlanMapBoundLoss', loss_weight=3.0, dis_thresh=1.0),
-    loss_plan_col=dict(type='PlanCollisionLoss', loss_weight=1.0),
     loss_vae_gen=dict(type='ProbabilisticLoss', loss_weight=3.0),
     img_backbone=dict(
         type='EVAViT',
@@ -198,7 +202,7 @@ model = dict(
         with_cp=True, 
         frozen=False,), 
     map_head=dict(
-        type='OrionHeadM',
+        type='CoTHeadM',
         num_classes=6,
         in_channels=1024,
         out_dims=4096,
@@ -240,7 +244,7 @@ model = dict(
         loss_bbox=dict(type='L1Loss', loss_weight=0.02),
         loss_dir=dict(type='PtsDirCosLoss', loss_weight=0.0)), #
     pts_bbox_head=dict(
-        type='OrionHead',
+        type='CoTHead',
         num_classes=9,
         in_channels=1024,
         out_dims=4096,
@@ -253,13 +257,22 @@ model = dict(
         n_control=11, # align with centerline query defination
         match_with_velo=False,
         pred_traffic_light_state=True,
-        use_col_loss = use_col_loss,
         use_memory = use_memory,
+        use_col_loss = use_col_loss,
         scalar=10, ##noise groups
         noise_scale = 1.0, 
         dn_weight= 1.0, ##dn loss weight
         split = 0.75, ###positive rate
-        use_pe=False, ## we don't have bev coord
+        memory_decoder_transformer = dict(
+            type='OrionTransformerDecoder',
+            num_layers=1,
+            embed_dims=_dim_,
+            num_heads=8,
+            dropout=0.0,
+            feedforward_dims=_ffn_dim_,
+            with_cp=True,
+            flash_attn=True,
+            return_intermediate=False),
         motion_transformer_decoder=dict(
             type='OrionTransformerDecoder',
             num_layers=1,
@@ -280,16 +293,6 @@ model = dict(
             post_max_size=300,
             nms_thr=0.1,
         ),
-        memory_decoder_transformer = dict(
-            type='OrionTransformerDecoder',
-            num_layers=1,
-            embed_dims=_dim_,
-            num_heads=8,
-            dropout=0.0,
-            feedforward_dims=_ffn_dim_,
-            with_cp=True,
-            flash_attn=True,
-            return_intermediate=False),
         transformer=dict(
             type='PETRTemporalTransformer',
                  input_dimension=256,
@@ -303,8 +306,8 @@ model = dict(
                  flash_attn=True,
             ),
         bbox_coder=dict(
-            type='CustomNMSFreeCoder',
-            post_center_range=[-61.2, -61.2, -10.0, 61.2, 61.2, 10.0],
+            type='NMSFreeCoder',
+            post_center_range=[-61.2, -61.2, -10.0, 61.2, 61.2, 10.0],# 检测到的边界框的中心点的范围。
             pc_range=point_cloud_range, # 
             max_num=300,
             voxel_size=voxel_size,
@@ -338,6 +341,7 @@ model = dict(
             )
             )
 
+
 dataset_type = "B2DOrionDataset"
 data_root = "data/bench2drive"
 info_root = "data/infos"
@@ -352,19 +356,19 @@ ann_file_test=info_root + f"/b2d_infos_val.pkl"
 
 train_pipeline = [
     dict(type="LoadMultiViewImageFromFilesInCeph", to_float32=True),
-    dict(type="PhotoMetricDistortionMultiViewImage"), # 数据增强，逐个对图像应用光度失真，每次变换都以50%的概率应用
+    dict(type="PhotoMetricDistortionMultiViewImage"), 
     dict(type='LoadAnnotations3D', with_bbox_3d=True, with_label_3d=True, with_attr_label=True,with_light_state=True),
     dict(type='VADObjectRangeFilter', point_cloud_range=point_cloud_range),
     dict(type='VADObjectNameFilter', classes=class_names),
     
     dict(type='LoadAnnoatationVQA', 
-        base_desc_path=None,
+        base_desc_path='./data/chat-B2D/train',
         tokenizer=llm_path, 
         max_length=2048, 
         use_gen_token=use_gen_token,
-        planning_qa_only=True,
-        planning_qa_last =True,
+        pretrain = pretrain,
         ),
+
     dict(type='ResizeCropFlipRotImage', data_aug_conf = ida_aug_conf, training=True),
     dict(type='ResizeMultiview3D', img_scale=(640, 640), keep_ratio=False, multiscale_mode='value'),
     dict(type="PadMultiViewImage", size_divisor=32),
@@ -453,11 +457,8 @@ train=dict(
         past_frames=past_frames,
         future_frames=future_frames,
         point_cloud_range=point_cloud_range,
-        polyline_points_num=map_fixed_ptsnum_per_gt_line,
-        # we use box_type_3d='LiDAR' in kitti and nuscenes dataset
-        # and box_type_3d='Depth' in sunrgbd and scannet dataset.
+        polyline_points_num=map_fixed_ptsnum_per_gt_line, 
         box_type_3d='LiDAR',
-        #custom_eval_version='vad_nusc_detection_cvpr_2019'
         ),
     val=dict(type=dataset_type,
             data_root=data_root,
@@ -494,7 +495,7 @@ train=dict(
     shuffler_sampler=dict(
         type="InfiniteGroupEachSampleInBatchSampler",
         seq_split_num=10,
-        warmup_split_num=80, # lane det and vlm need short term temporal fusion in the early stage of training
+        warmup_split_num=80,
         num_iters_to_seq=num_iters_per_epoch,),
     nonshuffler_sampler=dict(type="DistributedSampler"),
     )
@@ -510,7 +511,7 @@ optimizer = dict(constructor='LearningRateDecayOptimizerConstructor', type='Adam
                                 })
 
 optimizer_config = dict(type='Fp16OptimizerHook', loss_scale='dynamic', grad_clip=dict(max_norm=35, norm_type=2))
-# learning policy
+
 lr_config = dict(
     policy='CosineAnnealing',
     warmup='linear',
@@ -528,5 +529,5 @@ log_config = dict(
     interval=10, hooks=[dict(type="TextLoggerHook"), dict(type="TensorboardLoggerHook")]
 )
 
-load_from=None
+load_from='ckpts/eva02_petr_proj.pth'
 resume_from=None

@@ -28,4 +28,15 @@ TEAM_CONFIG=adzoo/orion/configs/orion_stage3_agent.py+[CHECKPOINT_PATH]
 
 3.报错提示
 1.出现WARNING: tokenization mismatch: 832 vs. 823. (ignored)
-解决方法：
+解决方法：1.将所有use_fast 改为true 2.将transformers库改为版本transformers == 4.31.0
+
+
+
+
+4. To DO 
+    -- 为了添加Diffusion的功能，我们需要自己生成infos,参考orion的工具：https://github.com/Thinklab-SJTU/Bench2DriveZoo/blob/uniad/vad/docs/DATA_PREP.md
+    cd mmcv/datasets
+        python prepare_B2D.py --workers 16 
+    The command will generate b2d_infos_train.pkl, b2d_infos_val.pkl, b2d_map_infos.pkl under data/infos.
+    -- 
+

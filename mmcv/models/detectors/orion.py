@@ -192,7 +192,7 @@ class Orion(MVXTwoStageDetector):
         
         use_critical_qa = use_critical_qa or qa_pretrain
         self.qa_pretrain = qa_pretrain
-        if lm_head is not None:
+        if lm_head is not None: #这里是加载LLM的代码，下次处理学习一下
             lm_kwargs = dict(use_gen_token=use_gen_token,use_critical_qa=use_critical_qa)
             self.lm_head = load_model(lm_head, use_lora, frozen, lm_kwargs, fp16_infer)
         if use_gen_token:
@@ -342,7 +342,7 @@ class Orion(MVXTwoStageDetector):
                 B, N, C, H, W = img.size()
                 img = img.reshape(B * N, C, H, W)
             if self.use_grid_mask:
-                img = self.grid_mask(img)
+                img = self.grid_mask(img) #在图像上做随机mask
 
             img_feats = self.img_backbone(img)
             if isinstance(img_feats, dict):
@@ -364,6 +364,11 @@ class Orion(MVXTwoStageDetector):
         """Extract features from images and points."""
         img_feats = self.extract_img_feat(img)
         return img_feats
+
+    def param_count(module):
+        total = sum(p.numel() for p in module.parameters())
+        trainable = sum(p.numel() for p in module.parameters() if p.requires_grad)
+        return total, trainable
 
     def prepare_location(self, img_metas, **data):
         pad_h, pad_w, _ = img_metas[0]['pad_shape'][0]
@@ -476,19 +481,19 @@ class Orion(MVXTwoStageDetector):
         if self.test_flag: #for interval evaluation
             self.pts_bbox_head.reset_memory()
             self.test_flag = False
-        if self.tokenizer is not None:
+        if self.tokenizer is not None:# 一个是为了生成attention_mask,另一个是为了把loss mask掉
             input_ids = torch.nn.utils.rnn.pad_sequence(
                 input_ids, # [(76,)]
                 batch_first=True,
-                padding_value=self.tokenizer.pad_token_id) # (1, 76)
+                padding_value=self.tokenizer.pad_token_id) # (1, 76) 
             
             vlm_labels = torch.nn.utils.rnn.pad_sequence(vlm_labels, # [(76,)]
                                                     batch_first=True,
-                                                    padding_value=IGNORE_INDEX) # (1, 76)
+                                                    padding_value=IGNORE_INDEX) # (1, 76),为啥用不一样的
             
             input_ids = input_ids[:, :self.tokenizer.model_max_length] # 2048
             vlm_labels = vlm_labels[:, :self.tokenizer.model_max_length] # 2048
-            vlm_attn_mask = input_ids.ne(self.tokenizer.pad_token_id) # (1, 76)
+            vlm_attn_mask = input_ids.ne(self.tokenizer.pad_token_id) # (1, 76)，就是在input_ids上做的
         else:
             input_ids = None
             vlm_labels = None
@@ -496,7 +501,7 @@ class Orion(MVXTwoStageDetector):
         # img_metas = [img_metas[0][0]] # BUG:这样不是seq
         img_metas = [img_meta[0] for img_meta in img_metas]
 
-        data['img_feats'] = self.extract_feat(data['img'])
+        data['img_feats'] = self.extract_feat(data['img']) #也就是过一个backbone，但是是一个2D的backbone，也就是说输入的是2D特征，不够抽象；BEV前面也是2D
         losses = self.forward_pts_train(gt_bboxes_3d, gt_labels_3d, gt_attr_labels,map_gt_bboxes_3d, map_gt_labels_3d, img_metas,input_ids, vlm_labels, vlm_attn_mask, ego_fut_trajs,**data)
 
         return losses
@@ -528,25 +533,25 @@ class Orion(MVXTwoStageDetector):
             dict: Losses of each branch.
         """
         B = data['img'].shape[0]
-        location = self.prepare_location(img_metas, **data) # (6, 40, 40, 2)
-        pos_embed = self.position_embeding(data, location, img_metas) # (1, 9600, 256)
+        location = self.prepare_location(img_metas, **data) # (6*4, 40, 40, 2),每个image的归一化坐标
+        pos_embed = self.position_embeding(data, location, img_metas) # (1, 9600, 256) #中间是6*40*40，这是图像位置编码,不同batch公用一个
         losses = dict()
 
         if self.with_pts_bbox:
-            outs_bbox, det_query = self.pts_bbox_head(img_metas, pos_embed, **data) # (1, 257, 4096)
+            outs_bbox, det_query = self.pts_bbox_head(img_metas, pos_embed, **data) # (1, 257, 4096),目标检测
             vision_embeded_obj = det_query.clone()
-            loss_inputs = [gt_bboxes_3d, gt_labels_3d, outs_bbox, gt_attr_labels]
+            loss_inputs = [gt_bboxes_3d, gt_labels_3d, outs_bbox, gt_attr_labels] #一个是embedding，是个是labels
             if self.pts_bbox_head.pred_traffic_light_state:
                 loss_inputs.append(data['traffic_state'])
                 loss_inputs.append(data['traffic_state_mask'])
             if self.use_col_loss:
                 loss, agent_outs = self.pts_bbox_head.loss(*loss_inputs)
             else:
-                loss = self.pts_bbox_head.loss(*loss_inputs)
+                loss = self.pts_bbox_head.loss(*loss_inputs) #这里已经离散为dict作为输入了
             losses.update(loss)
             
         if self.with_map_head:
-            outs_lane, map_query = self.map_head(img_metas, pos_embed, **data)
+            outs_lane, map_query = self.map_head(img_metas, pos_embed, **data) # torch.Size([4, 256, 4096]),静态属性
             vision_embeded_map = map_query.clone()
             # reference vad trans
             device = gt_labels_3d[0].device

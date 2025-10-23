@@ -9,7 +9,7 @@
             "args": [
                 "--nproc_per_node=1", // 根据你的GPUS_PER_NODE
                 "--master_addr=127.0.0.1",
-                "--master_port=54621",
+                "--master_port=54622",
                 "--nnodes=1",         // 根据你的NNODES
                 "--node_rank=0",
                 "${workspaceFolder}/adzoo/orion/train.py",
@@ -18,7 +18,11 @@
                 "--deterministic",
                 "--work-dir", "${workspaceFolder}/adzoo/orion/work_dirs/orion_stage1_train/"
             ],
-            "console": "integratedTerminal"
+            "console": "integratedTerminal",
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "0",
+                "NCCL_DEBUG": "WARN"
+            },
         },
         {
             "name": "Debug Train Orion Stage2",
@@ -55,6 +59,26 @@
                 "--launcher", "pytorch",
                 "--deterministic",
                 "--work-dir", "${workspaceFolder}/adzoo/orion/work_dirs/orion_stage3_train/"
+            ],
+            "console": "integratedTerminal"
+        },
+
+        {
+            "name": "Debug Train CoT Stage1",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "torch.distributed.launch",
+            "args": [
+                "--nproc_per_node=1", // 根据你的GPUS_PER_NODE
+                "--master_addr=127.0.0.1",
+                "--master_port=54620",
+                "--nnodes=1",         // 根据你的NNODES
+                "--node_rank=0",
+                "${workspaceFolder}/adzoo/cot/train.py",
+                "${workspaceFolder}/adzoo/cot/configs/cot_stage1_train.py",
+                "--launcher", "pytorch",
+                "--deterministic",
+                "--work-dir", "${workspaceFolder}/adzoo/cot/work_dirs/cot_stage1_train/"
             ],
             "console": "integratedTerminal"
         },

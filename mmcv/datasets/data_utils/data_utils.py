@@ -183,16 +183,16 @@ def tokenizer_image_token(prompt, tokenizer, image_token_index=IMAGE_TOKEN_INDEX
     prompt_chunks = [tokenizer(chunk).input_ids for chunk in prompt.split('<image>')]
 
     def insert_separator(X, sep):
-        return [ele for sublist in zip(X, [sep]*len(X)) for ele in sublist][:-1]
+        return [ele for sublist in zip(X, [sep]*len(X)) for ele in sublist][:-1]# 求你了，不要写这种炫技的了，顺序执行前后，然后获得从0到最后一个
 
     input_ids = []
     offset = 0
     if len(prompt_chunks) > 0 and len(prompt_chunks[0]) > 0 and prompt_chunks[0][0] == tokenizer.bos_token_id:
         offset = 1
-        input_ids.append(prompt_chunks[0][0])
+        input_ids.append(prompt_chunks[0][0]) #添加对话的开始
 
     for x in insert_separator(prompt_chunks, [image_token_index] * (offset + 1)):
-        input_ids.extend(x[offset:])
+        input_ids.extend(x[offset:]) #注意，用的是extend，不是append
 
     if return_tensors is not None:
         if return_tensors == 'pt':
@@ -337,7 +337,7 @@ def preprocess_llama_2(
         labels=targets,
     )
 
-
+# 深入理解这个函数才能深入理解大模型使用的API接口函数
 def preprocess_v1(
     sources,
     tokenizer: transformers.PreTrainedTokenizer,
@@ -348,7 +348,7 @@ def preprocess_v1(
     conv = conversation_lib.default_conversation.copy()
     roles = {"human": conv.roles[0], "gpt": conv.roles[1]}
 
-    # Apply prompt templates
+    # Apply prompt templates,和batch有关
     conversations = []
     for i, source in enumerate(sources):
         if roles[source[0]["from"]] != conv.roles[0]:
@@ -368,9 +368,9 @@ def preprocess_v1(
     # Tokenize conversations
 
     if has_image:
-        if training_mode:
+        if training_mode: #有图片且是训练模式的话会比较麻烦
             input_ids = torch.stack([tokenizer_image_token(prompt, tokenizer, return_tensors='pt') for prompt in conversations], dim=0)
-        else:
+        else: #infer的时候只需要一个promt 直接e2e2预测即可
             input_ids = [tokenizer_image_token(prompt, tokenizer, return_tensors='pt') for prompt in conversations]
             return dict(
                 input_ids=input_ids,
@@ -384,7 +384,7 @@ def preprocess_v1(
             truncation=True,
         ).input_ids
     
-    input_ids = input_ids[:, :tokenizer.model_max_length]
+    input_ids = input_ids[:, :tokenizer.model_max_length] #截断，希望到时我添加的env token不会超标
     
     targets = input_ids.clone()
 
@@ -392,12 +392,12 @@ def preprocess_v1(
 
     # Mask targets
     sep = conv.sep + conv.roles[1] + ": "
-    for conversation, target in zip(conversations, targets):
+    for conversation, target in zip(conversations, targets): #targets不过是prompt的一个copy
         total_len = int(target.ne(tokenizer.pad_token_id).sum())
 
         rounds = conversation.split(conv.sep2)
         cur_len = 1
-        target[:cur_len] = IGNORE_INDEX
+        target[:cur_len] = IGNORE_INDEX #mask掉prompt
         for i, rou in enumerate(rounds):
             if rou == "":
                 break
@@ -405,19 +405,19 @@ def preprocess_v1(
             parts = rou.split(sep)
             if len(parts) != 2:
                 break
-            parts[0] += sep
+            parts[0] += sep #最后加一个ASSISTANT
 
             if has_image:
-                round_len = len(tokenizer_image_token(rou, tokenizer))
-                instruction_len = len(tokenizer_image_token(parts[0], tokenizer)) - 2
+                round_len = len(tokenizer_image_token(rou, tokenizer)) #这个函数作用就是加上把<image>替换成image_token_index
+                instruction_len = len(tokenizer_image_token(parts[0], tokenizer)) - 2 #为啥要-2？因为前面有个bos token
             else:
                 round_len = len(tokenizer(rou).input_ids)
                 instruction_len = len(tokenizer(parts[0]).input_ids) - 2
 
-            target[cur_len : cur_len + instruction_len] = IGNORE_INDEX
+            target[cur_len : cur_len + instruction_len] = IGNORE_INDEX #把instruction部分都屏蔽掉,只在我们关注的回答部分计算loss
 
             cur_len += round_len
-        target[cur_len:] = IGNORE_INDEX
+        target[cur_len:] = IGNORE_INDEX #在对话末尾，可能还有一些 padding 或者额外 token，没有被明确划分为 assistant 的回答；不过这里还没有Padding
 
         if cur_len < tokenizer.model_max_length:
             if cur_len != total_len:
@@ -429,9 +429,9 @@ def preprocess_v1(
                     )
 
     return dict(
-        input_ids=input_ids,
-        labels=targets,
-    )
+        input_ids=input_ids, #所以target和input_ids是长度是一样的，只是instruction部分被屏蔽掉了
+        labels=targets,      #看模型怎么用，直接input的话就是teacher forcing
+    ) #模型内部有casual mask，不需要手动错位，直接对齐就好
 
 
 def preprocess_mpt(

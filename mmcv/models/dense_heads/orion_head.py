@@ -853,7 +853,7 @@ class OrionHead(AnchorFreeHead):
                 invalid_motion_idx = invalid_motion_idx.unsqueeze(2).repeat(1, 1, self.fut_mode).flatten(1, 2)
             else:
                 invalid_motion_idx = None
-
+            # 这个motion应该是其他物体的motion才对
             motion_query = motion_query.permute(1, 0, 2) # batch first
             motion_hs = self.motion_decoder(
                 query=motion_query,

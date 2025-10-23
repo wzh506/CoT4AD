@@ -50,7 +50,7 @@ dictor
 # torchvision==0.19.1+cu118
 flash-attn==0.2.8
 shapely==1.8.5.post1
-# transformers == 4.31.0
+# transformers == 4.31.0 #最好就用这个版本，不然可能会会出现mismatch的报错
 peft==0.12.0
 numpy==1.23.0
 numba==0.48.0
